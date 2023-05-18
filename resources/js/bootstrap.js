@@ -13,9 +13,9 @@ window.axios = axios;
 
 try {
     window.Popper = Popper;
-   // window.Bundle = Bundle;
     window.$ = window.jQuery = require('jquery');
 
+    // window.Bundle = Bundle;
     // window.Swal = Swal;
 
 }catch (e) {}

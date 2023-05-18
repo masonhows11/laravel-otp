@@ -1,0 +1,3241 @@
+var url = require("url");
+var URL = url.URL;
+var http = require("http");
+var https = require("https");
+var Writable = require("stream").Writable;
+var assert = require("assert");
+var debug = require("./debug");
+
+// Create handlers that pass events from native requests
+var events = ["abort", "aborted", "connect", "error", "socket", "timeout"];
+var eventHandlers = Object.create(null);
+events.forEach(function (event) {
+  eventHandlers[event] = function (arg1, arg2, arg3) {
+    this._redirectable.emit(event, arg1, arg2, arg3);
+  };
+});
+
+var InvalidUrlError = createErrorType(
+  "ERR_INVALID_URL",
+  "Invalid URL",
+  TypeError
+);
+// Error types with codes
+var RedirectionError = createErrorType(
+  "ERR_FR_REDIRECTION_FAILURE",
+  "Redirected request failed"
+);
+var TooManyRedirectsError = createErrorType(
+  "ERR_FR_TOO_MANY_REDIRECTS",
+  "Maximum number of redirects exceeded"
+);
+var MaxBodyLengthExceededError = createErrorType(
+  "ERR_FR_MAX_BODY_LENGTH_EXCEEDED",
+  "Request body larger than maxBodyLength limit"
+);
+var WriteAfterEndError = createErrorType(
+  "ERR_STREAM_WRITE_AFTER_END",
+  "write after end"
+);
+
+// An HTTP(S) request that can be redirected
+function RedirectableRequest(options, responseCallback) {
+  // Initialize the request
+  Writable.call(this);
+  this._sanitizeOptions(options);
+  this._options = options;
+  this._ended = false;
+  this._ending = false;
+  this._redirectCount = 0;
+  this._redirects = [];
+  this._requestBodyLength = 0;
+  this._requestBodyBuffers = [];
+
+  // Attach a callback if passed
+  if (responseCallback) {
+    this.on("response", responseCallback);
+  }
+
+  // React to responses of native requests
+  var self = this;
+  this._onNativeResponse = function (response) {
+    self._processResponse(response);
+  };
+
+  // Perform the first request
+  this._performRequest();
+}
+RedirectableRequest.prototype = Object.create(Writable.prototype);
+
+RedirectableRequest.prototype.abort = function () {
+  abortRequest(this._currentRequest);
+  this.emit("abort");
+};
+
+// Writes buffered data to the current native request
+RedirectableRequest.prototype.write = function (data, encoding, callback) {
+  // Writing is not allowed if end has been called
+  if (this._ending) {
+    throw new WriteAfterEndError();
+  }
+
+  // Validate input and shift parameters if necessary
+  if (!isString(data) && !isBuffer(data)) {
+    throw new TypeError("data should be a string, Buffer or Uint8Array");
+  }
+  if (isFunction(encoding)) {
+    callback = encoding;
+    encoding = null;
+  }
+
+  // Ignore empty buffers, since writing them doesn't invoke the callback
+  // https://github.com/nodejs/node/issues/22066
+  if (data.length === 0) {
+    if (callback) {
+      callback();
+    }
+    return;
+  }
+  // Only write when we don't exceed the maximum body length
+  if (this._requestBodyLength + data.length <= this._options.maxBodyLength) {
+    this._requestBodyLength += data.length;
+    this._requestBodyBuffers.push({ data: data, encoding: encoding });
+    this._currentRequest.write(data, encoding, callback);
+  }
+  // Error when we exceed the maximum body length
+  else {
+    this.emit("error", new MaxBodyLengthExceededError());
+    this.abort();
+  }
+};
+
+// Ends the current native request
+RedirectableRequest.prototype.end = function (data, encoding, callback) {
+  // Shift parameters if necessary
+  if (isFunction(data)) {
+    callback = data;
+    data = encoding = null;
+  }
+  else if (isFunction(encoding)) {
+    callback = encoding;
+    encoding = null;
+  }
+
+  // Write data if needed and end
+  if (!data) {
+    this._ended = this._ending = true;
+    this._currentRequest.end(null, null, callback);
+  }
+  else {
+    var self = this;
+    var currentRequest = this._currentRequest;
+    this.write(data, encoding, function () {
+      self._ended = true;
+      currentRequest.end(null, null, callback);
+    });
+    this._ending = true;
+  }
+};
+
+// Sets a header value on the current native request
+RedirectableRequest.prototype.setHeader = function (name, value) {
+  this._options.headers[name] = value;
+  this._currentRequest.setHeader(name, value);
+};
+
+// Clears a header value on the current native request
+RedirectableRequest.prototype.removeHeader = function (name) {
+  delete this._options.headers[name];
+  this._currentRequest.removeHeader(name);
+};
+
+// Global timeout for all underlying requests
+RedirectableRequest.prototype.setTimeout = function (msecs, callback) {
+  var self = this;
+
+  // Destroys the socket on timeout
+  function destroyOnTimeout(socket) {
+    socket.setTimeout(msecs);
+    socket.removeListener("timeout", socket.destroy);
+    socket.addListener("timeout", socket.destroy);
+  }
+
+  // Sets up a timer to trigger a timeout event
+  function startTimer(socket) {
+    if (self._timeout) {
+      clearTimeout(self._timeout);
+    }
+    self._timeout = setTimeout(function () {
+      self.emit("timeout");
+      clearTimer();
+    }, msecs);
+    destroyOnTimeout(socket);
+  }
+
+  // Stops a timeout from triggering
+  function clearTimer() {
+    // Clear the timeout
+    if (self._timeout) {
+      clearTimeout(self._timeout);
+      self._timeout = null;
+    }
+
+    // Clean up all attached listeners
+    self.removeListener("abort", clearTimer);
+    self.removeListener("error", clearTimer);
+    self.removeListener("response", clearTimer);
+    if (callback) {
+      self.removeListener("timeout", callback);
+    }
+    if (!self.socket) {
+      self._currentRequest.removeListener("socket", startTimer);
+    }
+  }
+
+  // Attach callback if passed
+  if (callback) {
+    this.on("timeout", callback);
+  }
+
+  // Start the timer if or when the socket is opened
+  if (this.socket) {
+    startTimer(this.socket);
+  }
+  else {
+    this._currentRequest.once("socket", startTimer);
+  }
+
+  // Clean up on events
+  this.on("socket", destroyOnTimeout);
+  this.on("abort", clearTimer);
+  this.on("error", clearTimer);
+  this.on("response", clearTimer);
+
+  return this;
+};
+
+// Proxy all other public ClientRequest methods
+[
+  "flushHeaders", "getHeader",
+  "setNoDelay", "setSocketKeepAlive",
+].forEach(function (method) {
+  RedirectableRequest.prototype[method] = function (a, b) {
+    return this._currentRequest[method](a, b);
+  };
+});
+
+// Proxy all public ClientRequest properties
+["aborted", "connection", "socket"].forEach(function (property) {
+  Object.defineProperty(RedirectableRequest.prototype, property, {
+    get: function () { return this._currentRequest[property]; },
+  });
+});
+
+RedirectableRequest.prototype._sanitizeOptions = function (options) {
+  // Ensure headers are always present
+  if (!options.headers) {
+    options.headers = {};
+  }
+
+  // Since http.request treats host as an alias of hostname,
+  // but the url module interprets host as hostname plus port,
+  // eliminate the host property to avoid confusion.
+  if (options.host) {
+    // Use hostname if set, because it has precedence
+    if (!options.hostname) {
+      options.hostname = options.host;
+    }
+    delete options.host;
+  }
+
+  // Complete the URL object when necessary
+  if (!options.pathname && options.path) {
+    var searchPos = options.path.indexOf("?");
+    if (searchPos < 0) {
+      options.pathname = options.path;
+    }
+    else {
+      options.pathname = options.path.substring(0, searchPos);
+      options.search = options.path.substring(searchPos);
+    }
+  }
+};
+
+
+// Executes the next native request (initial or redirect)
+RedirectableRequest.prototype._performRequest = function () {
+  // Load the native protocol
+  var protocol = this._options.protocol;
+  var nativeProtocol = this._options.nativeProtocols[protocol];
+  if (!nativeProtocol) {
+    this.emit("error", new TypeError("Unsupported protocol " + protocol));
+    return;
+  }
+
+  // If specified, use the agent corresponding to the protocol
+  // (HTTP and HTTPS use different types of agents)
+  if (this._options.agents) {
+    var scheme = protocol.slice(0, -1);
+    this._options.agent = this._options.agents[scheme];
+  }
+
+  // Create the native request and set up its event handlers
+  var request = this._currentRequest =
+        nativeProtocol.request(this._options, this._onNativeResponse);
+  request._redirectable = this;
+  for (var event of events) {
+    request.on(event, eventHandlers[event]);
+  }
+
+  // RFC7230§5.3.1: When making a request directly to an origin server, […]
+  // a client MUST send only the absolute path […] as the request-target.
+  this._currentUrl = /^\//.test(this._options.path) ?
+    url.format(this._options) :
+    // When making a request to a proxy, […]
+    // a client MUST send the target URI in absolute-form […].
+    this._options.path;
+
+  // End a redirected request
+  // (The first request must be ended explicitly with RedirectableRequest#end)
+  if (this._isRedirect) {
+    // Write the request entity and end
+    var i = 0;
+    var self = this;
+    var buffers = this._requestBodyBuffers;
+    (function writeNext(error) {
+      // Only write if this request has not been redirected yet
+      /* istanbul ignore else */
+      if (request === self._currentRequest) {
+        // Report any write errors
+        /* istanbul ignore if */
+        if (error) {
+          self.emit("error", error);
+        }
+        // Write the next buffer if there are still left
+        else if (i < buffers.length) {
+          var buffer = buffers[i++];
+          /* istanbul ignore else */
+          if (!request.finished) {
+            request.write(buffer.data, buffer.encoding, writeNext);
+          }
+        }
+        // End the request if `end` has been called on us
+        else if (self._ended) {
+          request.end();
+        }
+      }
+    }());
+  }
+};
+
+// Processes a response from the current native request
+RedirectableRequest.prototype._processResponse = function (response) {
+  // Store the redirected response
+  var statusCode = response.statusCode;
+  if (this._options.trackRedirects) {
+    this._redirects.push({
+      url: this._currentUrl,
+      headers: response.headers,
+      statusCode: statusCode,
+    });
+  }
+
+  // RFC7231§6.4: The 3xx (Redirection) class of status code indicates
+  // that further action needs to be taken by the user agent in order to
+  // fulfill the request. If a Location header field is provided,
+  // the user agent MAY automatically redirect its request to the URI
+  // referenced by the Location field value,
+  // even if the specific status code is not understood.
+
+  // If the response is not a redirect; return it as-is
+  var location = response.headers.location;
+  if (!location || this._options.followRedirects === false ||
+      statusCode < 300 || statusCode >= 400) {
+    response.responseUrl = this._currentUrl;
+    response.redirects = this._redirects;
+    this.emit("response", response);
+
+    // Clean up
+    this._requestBodyBuffers = [];
+    return;
+  }
+
+  // The response is a redirect, so abort the current request
+  abortRequest(this._currentRequest);
+  // Discard the remainder of the response to avoid waiting for data
+  response.destroy();
+
+  // RFC7231§6.4: A client SHOULD detect and intervene
+  // in cyclical redirections (i.e., "infinite" redirection loops).
+  if (++this._redirectCount > this._options.maxRedirects) {
+    this.emit("error", new TooManyRedirectsError());
+    return;
+  }
+
+  // Store the request headers if applicable
+  var requestHeaders;
+  var beforeRedirect = this._options.beforeRedirect;
+  if (beforeRedirect) {
+    requestHeaders = Object.assign({
+      // The Host header was set by nativeProtocol.request
+      Host: response.req.getHeader("host"),
+    }, this._options.headers);
+  }
+
+  // RFC7231§6.4: Automatic redirection needs to done with
+  // care for methods not known to be safe, […]
+  // RFC7231§6.4.2–3: For historical reasons, a user agent MAY change
+  // the request method from POST to GET for the subsequent request.
+  var method = this._options.method;
+  if ((statusCode === 301 || statusCode === 302) && this._options.method === "POST" ||
+      // RFC7231§6.4.4: The 303 (See Other) status code indicates that
+      // the server is redirecting the user agent to a different resource […]
+      // A user agent can perform a retrieval request targeting that URI
+      // (a GET or HEAD request if using HTTP) […]
+      (statusCode === 303) && !/^(?:GET|HEAD)$/.test(this._options.method)) {
+    this._options.method = "GET";
+    // Drop a possible entity and headers related to it
+    this._requestBodyBuffers = [];
+    removeMatchingHeaders(/^content-/i, this._options.headers);
+  }
+
+  // Drop the Host header, as the redirect might lead to a different host
+  var currentHostHeader = removeMatchingHeaders(/^host$/i, this._options.headers);
+
+  // If the redirect is relative, carry over the host of the last request
+  var currentUrlParts = url.parse(this._currentUrl);
+  var currentHost = currentHostHeader || currentUrlParts.host;
+  var currentUrl = /^\w+:/.test(location) ? this._currentUrl :
+    url.format(Object.assign(currentUrlParts, { host: currentHost }));
+
+  // Determine the URL of the redirection
+  var redirectUrl;
+  try {
+    redirectUrl = url.resolve(currentUrl, location);
+  }
+  catch (cause) {
+    this.emit("error", new RedirectionError({ cause: cause }));
+    return;
+  }
+
+  // Create the redirected request
+  debug("redirecting to", redirectUrl);
+  this._isRedirect = true;
+  var redirectUrlParts = url.parse(redirectUrl);
+  Object.assign(this._options, redirectUrlParts);
+
+  // Drop confidential headers when redirecting to a less secure protocol
+  // or to a different domain that is not a superdomain
+  if (redirectUrlParts.protocol !== currentUrlParts.protocol &&
+     redirectUrlParts.protocol !== "https:" ||
+     redirectUrlParts.host !== currentHost &&
+     !isSubdomain(redirectUrlParts.host, currentHost)) {
+    removeMatchingHeaders(/^(?:authorization|cookie)$/i, this._options.headers);
+  }
+
+  // Evaluate the beforeRedirect callback
+  if (isFunction(beforeRedirect)) {
+    var responseDetails = {
+      headers: response.headers,
+      statusCode: statusCode,
+    };
+    var requestDetails = {
+      url: currentUrl,
+      method: method,
+      headers: requestHeaders,
+    };
+    try {
+      beforeRedirect(this._options, responseDetails, requestDetails);
+    }
+    catch (err) {
+      this.emit("error", err);
+      return;
+    }
+    this._sanitizeOptions(this._options);
+  }
+
+  // Perform the redirected request
+  try {
+    this._performRequest();
+  }
+  catch (cause) {
+    this.emit("error", new RedirectionError({ cause: cause }));
+  }
+};
+
+// Wraps the key/value object of protocols with redirect functionality
+function wrap(protocols) {
+  // Default settings
+  var exports = {
+    maxRedirects: 21,
+    maxBodyLength: 10 * 1024 * 1024,
+  };
+
+  // Wrap each protocol
+  var nativeProtocols = {};
+  Object.keys(protocols).forEach(function (scheme) {
+    var protocol = scheme + ":";
+    var nativeProtocol = nativeProtocols[protocol] = protocols[scheme];
+    var wrappedProtocol = exports[scheme] = Object.create(nativeProtocol);
+
+    // Executes a request, following redirects
+    function request(input, options, callback) {
+      // Parse parameters
+      if (isString(input)) {
+        var parsed;
+        try {
+          parsed = urlToOptions(new URL(input));
+        }
+        catch (err) {
+          /* istanbul ignore next */
+          parsed = url.parse(input);
+        }
+        if (!isString(parsed.protocol)) {
+          throw new InvalidUrlError({ input });
+        }
+        input = parsed;
+      }
+      else if (URL && (input instanceof URL)) {
+        input = urlToOptions(input);
+      }
+      else {
+        callback = options;
+        options = input;
+        input = { protocol: protocol };
+      }
+      if (isFunction(options)) {
+        callback = options;
+        options = null;
+      }
+
+      // Set defaults
+      options = Object.assign({
+        maxRedirects: exports.maxRedirects,
+        maxBodyLength: exports.maxBodyLength,
+      }, input, options);
+      options.nativeProtocols = nativeProtocols;
+      if (!isString(options.host) && !isString(options.hostname)) {
+        options.hostname = "::1";
+      }
+
+      assert.equal(options.protocol, protocol, "protocol mismatch");
+      debug("options", options);
+      return new RedirectableRequest(options, callback);
+    }
+
+    // Executes a GET request, following redirects
+    function get(input, options, callback) {
+      var wrappedRequest = wrappedProtocol.request(input, options, callback);
+      wrappedRequest.end();
+      return wrappedRequest;
+    }
+
+    // Expose the properties on the wrapped protocol
+    Object.defineProperties(wrappedProtocol, {
+      request: { value: request, configurable: true, enumerable: true, writable: true },
+      get: { value: get, configurable: true, enumerable: true, writable: true },
+    });
+  });
+  return exports;
+}
+
+/* istanbul ignore next */
+function noop() { /* empty */ }
+
+// from https://github.com/nodejs/node/blob/master/lib/internal/url.js
+function urlToOptions(urlObject) {
+  var options = {
+    protocol: urlObject.protocol,
+    hostname: urlObject.hostname.startsWith("[") ?
+      /* istanbul ignore next */
+      urlObject.hostname.slice(1, -1) :
+      urlObject.hostname,
+    hash: urlObject.hash,
+    search: urlObject.search,
+    pathname: urlObject.pathname,
+    path: urlObject.pathname + urlObject.search,
+    href: urlObject.href,
+  };
+  if (urlObject.port !== "") {
+    options.port = Number(urlObject.port);
+  }
+  return options;
+}
+
+function removeMatchingHeaders(regex, headers) {
+  var lastValue;
+  for (var header in headers) {
+    if (regex.test(header)) {
+      lastValue = headers[header];
+      delete headers[header];
+    }
+  }
+  return (lastValue === null || typeof lastValue === "undefined") ?
+    undefined : String(lastValue).trim();
+}
+
+function createErrorType(code, message, baseClass) {
+  // Create constructor
+  function CustomError(properties) {
+    Error.captureStackTrace(this, this.constructor);
+    Object.assign(this, properties || {});
+    this.code = code;
+    this.message = this.cause ? message + ": " + this.cause.message : message;
+  }
+
+  // Attach constructor and set default properties
+  CustomError.prototype = new (baseClass || Error)();
+  CustomError.prototype.constructor = CustomError;
+  CustomError.prototype.name = "Error [" + code + "]";
+  return CustomError;
+}
+
+function abortRequest(request) {
+  for (var event of events) {
+    request.removeListener(event, eventHandlers[event]);
+  }
+  request.on("error", noop);
+  request.abort();
+}
+
+function isSubdomain(subdomain, domain) {
+  assert(isString(subdomain) && isString(domain));
+  var dot = subdomain.length - domain.length - 1;
+  return dot > 0 && subdomain[dot] === "." && subdomain.endsWith(domain);
+}
+
+function isString(value) {
+  return typeof value === "string" || value instanceof String;
+}
+
+function isFunction(value) {
+  return typeof value === "function";
+}
+
+function isBuffer(value) {
+  return typeof value === "object" && ("length" in value);
+}
+
+// Exports
+module.exports = wrap({ http: http, https: https });
+module.exports.wrap = wrap;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            # debug
+[![Build Status](https://travis-ci.org/visionmedia/debug.svg?branch=master)](https://travis-ci.org/visionmedia/debug)  [![Coverage Status](https://coveralls.io/repos/github/visionmedia/debug/badge.svg?branch=master)](https://coveralls.io/github/visionmedia/debug?branch=master)  [![Slack](https://visionmedia-community-slackin.now.sh/badge.svg)](https://visionmedia-community-slackin.now.sh/) [![OpenCollective](https://opencollective.com/debug/backers/badge.svg)](#backers) 
+[![OpenCollective](https://opencollective.com/debug/sponsors/badge.svg)](#sponsors)
+
+
+
+A tiny node.js debugging utility modelled after node core's debugging technique.
+
+**Discussion around the V3 API is under way [here](https://github.com/visionmedia/debug/issues/370)**
+
+## Installation
+
+```bash
+$ npm install debug
+```
+
+## Usage
+
+`debug` exposes a function; simply pass this function the name of your module, and it will return a decorated version of `console.error` for you to pass debug statements to. This will allow you to toggle the debug output for different parts of your module as well as the module as a whole.
+
+Example _app.js_:
+
+```js
+var debug = require('debug')('http')
+  , http = require('http')
+  , name = 'My App';
+
+// fake app
+
+debug('booting %s', name);
+
+http.createServer(function(req, res){
+  debug(req.method + ' ' + req.url);
+  res.end('hello\n');
+}).listen(3000, function(){
+  debug('listening');
+});
+
+// fake worker of some kind
+
+require('./worker');
+```
+
+Example _worker.js_:
+
+```js
+var debug = require('debug')('worker');
+
+setInterval(function(){
+  debug('doing some work');
+}, 1000);
+```
+
+ The __DEBUG__ environment variable is then used to enable these based on space or comma-delimited names. Here are some examples:
+
+  ![debug http and worker](http://f.cl.ly/items/18471z1H402O24072r1J/Screenshot.png)
+
+  ![debug worker](http://f.cl.ly/items/1X413v1a3M0d3C2c1E0i/Screenshot.png)
+
+#### Windows note
+
+ On Windows the environment variable is set using the `set` command.
+
+ ```cmd
+ set DEBUG=*,-not_this
+ ```
+
+ Note that PowerShell uses different syntax to set environment variables.
+
+ ```cmd
+ $env:DEBUG = "*,-not_this"
+  ```
+
+Then, run the program to be debugged as usual.
+
+## Millisecond diff
+
+  When actively developing an application it can be useful to see when the time spent between one `debug()` call and the next. Suppose for example you invoke `debug()` before requesting a resource, and after as well, the "+NNNms" will show you how much time was spent between calls.
+
+  ![](http://f.cl.ly/items/2i3h1d3t121M2Z1A3Q0N/Screenshot.png)
+
+  When stdout is not a TTY, `Date#toUTCString()` is used, making it more useful for logging the debug information as shown below:
+
+  ![](http://f.cl.ly/items/112H3i0e0o0P0a2Q2r11/Screenshot.png)
+
+## Conventions
+
+  If you're using this in one or more of your libraries, you _should_ use the name of your library so that developers may toggle debugging as desired without guessing names. If you have more than one debuggers you _should_ prefix them with your library name and use ":" to separate features. For example "bodyParser" from Connect would then be "connect:bodyParser".
+
+## Wildcards
+
+  The `*` character may be used as a wildcard. Suppose for example your library has debuggers named "connect:bodyParser", "connect:compress", "connect:session", instead of listing all three with `DEBUG=connect:bodyParser,connect:compress,connect:session`, you may simply do `DEBUG=connect:*`, or to run everything using this module simply use `DEBUG=*`.
+
+  You can also exclude specific debuggers by prefixing them with a "-" character.  For example, `DEBUG=*,-connect:*` would include all debuggers except those starting with "connect:".
+
+## Environment Variables
+
+  When running through Node.js, you can set a few environment variables that will
+  change the behavior of the debug logging:
+
+| Name      | Purpose                                         |
+|-----------|-------------------------------------------------|
+| `DEBUG`   | Enables/disables specific debugging namespaces. |
+| `DEBUG_COLORS`| Whether or not to use colors in the debug output. |
+| `DEBUG_DEPTH` | Object inspection depth. |
+| `DEBUG_SHOW_HIDDEN` | Shows hidden properties on inspected objects. |
+
+
+  __Note:__ The environment variables beginning with `DEBUG_` end up being
+  converted into an Options object that gets used with `%o`/`%O` formatters.
+  See the Node.js documentation for
+  [`util.inspect()`](https://nodejs.org/api/util.html#util_util_inspect_object_options)
+  for the complete list.
+
+## Formatters
+
+
+  Debug uses [printf-style](https://wikipedia.org/wiki/Printf_format_string) formatting. Below are the officially supported formatters:
+
+| Formatter | Representation |
+|-----------|----------------|
+| `%O`      | Pretty-print an Object on multiple lines. |
+| `%o`      | Pretty-print an Object all on a single line. |
+| `%s`      | String. |
+| `%d`      | Number (both integer and float). |
+| `%j`      | JSON. Replaced with the string '[Circular]' if the argument contains circular references. |
+| `%%`      | Single percent sign ('%'). This does not consume an argument. |
+
+### Custom formatters
+
+  You can add custom formatters by extending the `debug.formatters` object. For example, if you wanted to add support for rendering a Buffer as hex with `%h`, you could do something like:
+
+```js
+const createDebug = require('debug')
+createDebug.formatters.h = (v) => {
+  return v.toString('hex')
+}
+
+// …elsewhere
+const debug = createDebug('foo')
+debug('this is hex: %h', new Buffer('hello world'))
+//   foo this is hex: 68656c6c6f20776f726c6421 +0ms
+```
+
+## Browser support
+  You can build a browser-ready script using [browserify](https://github.com/substack/node-browserify),
+  or just use the [browserify-as-a-service](https://wzrd.in/) [build](https://wzrd.in/standalone/debug@latest),
+  if you don't want to build it yourself.
+
+  Debug's enable state is currently persisted by `localStorage`.
+  Consider the situation shown below where you have `worker:a` and `worker:b`,
+  and wish to debug both. You can enable this using `localStorage.debug`:
+
+```js
+localStorage.debug = 'worker:*'
+```
+
+And then refresh the page.
+
+```js
+a = debug('worker:a');
+b = debug('worker:b');
+
+setInterval(function(){
+  a('doing some work');
+}, 1000);
+
+setInterval(function(){
+  b('doing some work');
+}, 1200);
+```
+
+#### Web Inspector Colors
+
+  Colors are also enabled on "Web Inspectors" that understand the `%c` formatting
+  option. These are WebKit web inspectors, Firefox ([since version
+  31](https://hacks.mozilla.org/2014/05/editable-box-model-multiple-selection-sublime-text-keys-much-more-firefox-developer-tools-episode-31/))
+  and the Firebug plugin for Firefox (any version).
+
+  Colored output looks something like:
+
+  ![](https://cloud.githubusercontent.com/assets/71256/3139768/b98c5fd8-e8ef-11e3-862a-f7253b6f47c6.png)
+
+
+## Output streams
+
+  By default `debug` will log to stderr, however this can be configured per-namespace by overriding the `log` method:
+
+Example _stdout.js_:
+
+```js
+var debug = require('debug');
+var error = debug('app:error');
+
+// by default stderr is used
+error('goes to stderr!');
+
+var log = debug('app:log');
+// set this namespace to log via console.log
+log.log = console.log.bind(console); // don't forget to bind to console!
+log('goes to stdout');
+error('still goes to stderr!');
+
+// set all output to go via console.info
+// overrides all per-namespace log settings
+debug.log = console.info.bind(console);
+error('now goes to stdout via console.info');
+log('still goes to stdout, but via console.info now');
+```
+
+
+## Authors
+
+ - TJ Holowaychuk
+ - Nathan Rajlich
+ - Andrew Rhyne
+ 
+## Backers
+
+Support us with a monthly donation and help us continue our activities. [[Become a backer](https://opencollective.com/debug#backer)]
+
+<a href="https://opencollective.com/debug/backer/0/website" target="_blank"><img src="https://opencollective.com/debug/backer/0/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/1/website" target="_blank"><img src="https://opencollective.com/debug/backer/1/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/2/website" target="_blank"><img src="https://opencollective.com/debug/backer/2/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/3/website" target="_blank"><img src="https://opencollective.com/debug/backer/3/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/4/website" target="_blank"><img src="https://opencollective.com/debug/backer/4/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/5/website" target="_blank"><img src="https://opencollective.com/debug/backer/5/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/6/website" target="_blank"><img src="https://opencollective.com/debug/backer/6/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/7/website" target="_blank"><img src="https://opencollective.com/debug/backer/7/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/8/website" target="_blank"><img src="https://opencollective.com/debug/backer/8/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/9/website" target="_blank"><img src="https://opencollective.com/debug/backer/9/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/10/website" target="_blank"><img src="https://opencollective.com/debug/backer/10/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/11/website" target="_blank"><img src="https://opencollective.com/debug/backer/11/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/12/website" target="_blank"><img src="https://opencollective.com/debug/backer/12/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/13/website" target="_blank"><img src="https://opencollective.com/debug/backer/13/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/14/website" target="_blank"><img src="https://opencollective.com/debug/backer/14/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/15/website" target="_blank"><img src="https://opencollective.com/debug/backer/15/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/16/website" target="_blank"><img src="https://opencollective.com/debug/backer/16/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/17/website" target="_blank"><img src="https://opencollective.com/debug/backer/17/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/18/website" target="_blank"><img src="https://opencollective.com/debug/backer/18/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/19/website" target="_blank"><img src="https://opencollective.com/debug/backer/19/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/20/website" target="_blank"><img src="https://opencollective.com/debug/backer/20/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/21/website" target="_blank"><img src="https://opencollective.com/debug/backer/21/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/22/website" target="_blank"><img src="https://opencollective.com/debug/backer/22/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/23/website" target="_blank"><img src="https://opencollective.com/debug/backer/23/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/24/website" target="_blank"><img src="https://opencollective.com/debug/backer/24/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/25/website" target="_blank"><img src="https://opencollective.com/debug/backer/25/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/26/website" target="_blank"><img src="https://opencollective.com/debug/backer/26/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/27/website" target="_blank"><img src="https://opencollective.com/debug/backer/27/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/28/website" target="_blank"><img src="https://opencollective.com/debug/backer/28/avatar.svg"></a>
+<a href="https://opencollective.com/debug/backer/29/website" target="_blank"><img src="https://opencollective.com/debug/backer/29/avatar.svg"></a>
+
+
+## Sponsors
+
+Become a sponsor and get your logo on our README on Github with a link to your site. [[Become a sponsor](https://opencollective.com/debug#sponsor)]
+
+<a href="https://opencollective.com/debug/sponsor/0/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/0/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/1/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/1/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/2/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/2/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/3/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/3/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/4/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/4/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/5/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/5/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/6/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/6/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/7/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/7/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/8/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/8/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/9/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/9/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/10/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/10/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/11/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/11/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/12/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/12/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/13/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/13/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/14/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/14/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/15/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/15/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/16/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/16/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/17/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/17/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/18/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/18/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/19/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/19/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/20/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/20/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/21/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/21/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/22/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/22/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/23/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/23/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/24/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/24/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/25/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/25/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/26/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/26/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/27/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/27/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/28/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/28/avatar.svg"></a>
+<a href="https://opencollective.com/debug/sponsor/29/website" target="_blank"><img src="https://opencollective.com/debug/sponsor/29/avatar.svg"></a>
+
+## License
+
+(The MIT License)
+
+Copyright (c) 2014-2016 TJ Holowaychuk &lt;tj@vision-media.ca&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  # file-type [![Build Status](https://travis-ci.org/sindresorhus/file-type.svg?branch=master)](https://travis-ci.org/sindresorhus/file-type)
+
+> Detect the file type of a Buffer/Uint8Array/ArrayBuffer
+
+The file type is detected by checking the [magic number](https://en.wikipedia.org/wiki/Magic_number_(programming)#Magic_numbers_in_files) of the buffer.
+
+
+## Install
+
+```
+$ npm install file-type
+```
+
+
+## Usage
+
+##### Node.js
+
+```js
+const readChunk = require('read-chunk');
+const fileType = require('file-type');
+
+const buffer = readChunk.sync('unicorn.png', 0, fileType.minimumBytes);
+
+fileType(buffer);
+//=> {ext: 'png', mime: 'image/png'}
+```
+
+Or from a remote location:
+
+```js
+const https = require('https');
+const fileType = require('file-type');
+
+const url = 'https://upload.wikimedia.org/wikipedia/en/a/a9/Example.jpg';
+
+https.get(url, response => {
+	response.on('readable', () => {
+		const chunk = response.read(fileType.minimumBytes);
+		response.destroy();
+
+		console.log(fileType(chunk));
+		//=> {ext: 'jpg', mime: 'image/jpeg'}
+	});
+});
+```
+
+Or from a stream:
+
+```js
+const stream = require('stream');
+const fs = require('fs');
+const crypto = require('crypto');
+const fileType = require('file-type');
+
+(async () => {
+	const read = fs.createReadStream('encrypted.enc');
+	const decipher = crypto.createDecipheriv(alg, key, iv);
+
+	const fileTypeStream = await fileType.stream(stream.pipeline(read, decipher));
+
+	console.log(fileTypeStream.fileType);
+	//=> {ext: 'mov', mime: 'video/quicktime'}
+
+	const write = fs.createWriteStream(`decrypted.${fileTypeStream.fileType.ext}`);
+	fileTypeStream.pipe(write);
+})();
+```
+
+
+##### Browser
+
+```js
+const xhr = new XMLHttpRequest();
+xhr.open('GET', 'unicorn.png');
+xhr.responseType = 'arraybuffer';
+
+xhr.onload = () => {
+	fileType(new Uint8Array(this.response));
+	//=> {ext: 'png', mime: 'image/png'}
+};
+
+xhr.send();
+```
+
+
+## API
+
+### fileType(input)
+
+Returns an `object` with:
+
+- `ext` - One of the [supported file types](#supported-file-types)
+- `mime` - The [MIME type](https://en.wikipedia.org/wiki/Internet_media_type)
+
+Or `undefined` when there is no match.
+
+#### input
+
+Type: `Buffer | Uint8Array | ArrayBuffer`
+
+It only needs the first `.minimumBytes` bytes. The exception is detection of `docx`, `pptx`, and `xlsx` which potentially requires reading the whole file.
+
+### fileType.minimumBytes
+
+Type: `number`
+
+The minimum amount of bytes needed to detect a file type. Currently, it's 4100 bytes, but it can change, so don't hardcode it.
+
+### fileType.stream(readableStream)
+
+Detect the file type of a readable stream.
+
+Returns a `Promise` which resolves to the original readable stream argument, but with an added `fileType` property, which is an object like the one returned from `fileType()`.
+
+*Note:* This method is only for Node.js.
+
+#### readableStream
+
+Type: [`stream.Readable`](https://nodejs.org/api/stream.html#stream_class_stream_readable)
+
+### fileType.extensions
+
+Returns a set of supported file extensions.
+
+### fileType.mimeTypes
+
+Returns a set of supported MIME types.
+
+
+## Supported file types
+
+- [`jpg`](https://en.wikipedia.org/wiki/JPEG)
+- [`png`](https://en.wikipedia.org/wiki/Portable_Network_Graphics)
+- [`apng`](https://en.wikipedia.org/wiki/APNG) - Animated Portable Network Graphics
+- [`gif`](https://en.wikipedia.org/wiki/GIF)
+- [`webp`](https://en.wikipedia.org/wiki/WebP)
+- [`flif`](https://en.wikipedia.org/wiki/Free_Lossless_Image_Format)
+- [`cr2`](https://fileinfo.com/extension/cr2) - Canon Raw image file (v2)
+- [`orf`](https://en.wikipedia.org/wiki/ORF_format) - Olympus Raw image file
+- [`arw`](https://en.wikipedia.org/wiki/Raw_image_format#ARW) - Sony Alpha Raw image file
+- [`dng`](https://en.wikipedia.org/wiki/Digital_Negative) - Adobe Digital Negative image file
+- [`nef`](https://www.nikonusa.com/en/learn-and-explore/a/products-and-innovation/nikon-electronic-format-nef.html) - Nikon Electronic Format image file
+- [`rw2`](https://en.wikipedia.org/wiki/Raw_image_format) - Panasonic RAW image file
+- [`raf`](https://en.wikipedia.org/wiki/Raw_image_format) - Fujifilm RAW image file
+- [`tif`](https://en.wikipedia.org/wiki/Tagged_Image_File_Format)
+- [`bmp`](https://en.wikipedia.org/wiki/BMP_file_format)
+- [`jxr`](https://en.wikipedia.org/wiki/JPEG_XR)
+- [`psd`](https://en.wikipedia.org/wiki/Adobe_Photoshop#File_format)
+- [`zip`](https://en.wikipedia.org/wiki/Zip_(file_format))
+- [`tar`](https://en.wikipedia.org/wiki/Tar_(computing)#File_format)
+- [`rar`](https://en.wikipedia.org/wiki/RAR_(file_format))
+- [`gz`](https://en.wikipedia.org/wiki/Gzip)
+- [`bz2`](https://en.wikipedia.org/wiki/Bzip2)
+- [`7z`](https://en.wikipedia.org/wiki/7z)
+- [`dmg`](https://en.wikipedia.org/wiki/Apple_Disk_Image)
+- [`mp4`](https://en.wikipedia.org/wiki/MPEG-4_Part_14#Filename_extensions)
+- [`mid`](https://en.wikipedia.org/wiki/MIDI)
+- [`mkv`](https://en.wikipedia.org/wiki/Matroska)
+- [`webm`](https://en.wikipedia.org/wiki/WebM)
+- [`mov`](https://en.wikipedia.org/wiki/QuickTime_File_Format)
+- [`avi`](https://en.wikipedia.org/wiki/Audio_Video_Interleave)
+- [`mpg`](https://en.wikipedia.org/wiki/MPEG-1)
+- [`mp2`](https://en.wikipedia.org/wiki/MPEG-1_Audio_Layer_II)
+- [`mp3`](https://en.wikipedia.org/wiki/MP3)
+- [`ogg`](https://en.wikipedia.org/wiki/Ogg)
+- [`ogv`](https://en.wikipedia.org/wiki/Ogg)
+- [`ogm`](https://en.wikipedia.org/wiki/Ogg)
+- [`oga`](https://en.wikipedia.org/wiki/Ogg)
+- [`spx`](https://en.wikipedia.org/wiki/Ogg)
+- [`ogx`](https://en.wikipedia.org/wiki/Ogg)
+- [`opus`](https://en.wikipedia.org/wiki/Opus_(audio_format))
+- [`flac`](https://en.wikipedia.org/wiki/FLAC)
+- [`wav`](https://en.wikipedia.org/wiki/WAV)
+- [`qcp`](https://en.wikipedia.org/wiki/QCP)
+- [`amr`](https://en.wikipedia.org/wiki/Adaptive_Multi-Rate_audio_codec)
+- [`pdf`](https://en.wikipedia.org/wiki/Portable_Document_Format)
+- [`epub`](https://en.wikipedia.org/wiki/EPUB)
+- [`mobi`](https://en.wikipedia.org/wiki/Mobipocket) - Mobipocket
+- [`exe`](https://en.wikipedia.org/wiki/.exe)
+- [`swf`](https://en.wikipedia.org/wiki/SWF)
+- [`rtf`](https://en.wikipedia.org/wiki/Rich_Text_Format)
+- [`woff`](https://en.wikipedia.org/wiki/Web_Open_Font_Format)
+- [`woff2`](https://en.wikipedia.org/wiki/Web_Open_Font_Format)
+- [`eot`](https://en.wikipedia.org/wiki/Embedded_OpenType)
+- [`ttf`](https://en.wikipedia.org/wiki/TrueType)
+- [`otf`](https://en.wikipedia.org/wiki/OpenType)
+- [`ico`](https://en.wikipedia.org/wiki/ICO_(file_format))
+- [`flv`](https://en.wikipedia.org/wiki/Flash_Video)
+- [`ps`](https://en.wikipedia.org/wiki/Postscript)
+- [`xz`](https://en.wikipedia.org/wiki/Xz)
+- [`sqlite`](https://www.sqlite.org/fileformat2.html)
+- [`nes`](https://fileinfo.com/extension/nes)
+- [`crx`](https://developer.chrome.com/extensions/crx)
+- [`xpi`](https://en.wikipedia.org/wiki/XPInstall)
+- [`cab`](https://en.wikipedia.org/wiki/Cabinet_(file_format))
+- [`deb`](https://en.wikipedia.org/wiki/Deb_(file_format))
+- [`ar`](https://en.wikipedia.org/wiki/Ar_(Unix))
+- [`rpm`](https://fileinfo.com/extension/rpm)
+- [`Z`](https://fileinfo.com/extension/z)
+- [`lz`](https://en.wikipedia.org/wiki/Lzip)
+- [`msi`](https://en.wikipedia.org/wiki/Windows_Installer)
+- [`mxf`](https://en.wikipedia.org/wiki/Material_Exchange_Format)
+- [`mts`](https://en.wikipedia.org/wiki/.m2ts)
+- [`wasm`](https://en.wikipedia.org/wiki/WebAssembly)
+- [`blend`](https://wiki.blender.org/index.php/Dev:Source/Architecture/File_Format)
+- [`bpg`](https://bellard.org/bpg/)
+- [`docx`](https://en.wikipedia.org/wiki/Office_Open_XML)
+- [`pptx`](https://en.wikipedia.org/wiki/Office_Open_XML)
+- [`xlsx`](https://en.wikipedia.org/wiki/Office_Open_XML)
+- [`jp2`](https://en.wikipedia.org/wiki/JPEG_2000) - JPEG 2000
+- [`jpm`](https://en.wikipedia.org/wiki/JPEG_2000) - JPEG 2000
+- [`jpx`](https://en.wikipedia.org/wiki/JPEG_2000) - JPEG 2000
+- [`mj2`](https://en.wikipedia.org/wiki/Motion_JPEG_2000) - Motion JPEG 2000
+- [`aif`](https://en.wikipedia.org/wiki/Audio_Interchange_File_Format)
+- [`odt`](https://en.wikipedia.org/wiki/OpenDocument) - OpenDocument for word processing
+- [`ods`](https://en.wikipedia.org/wiki/OpenDocument) - OpenDocument for spreadsheets
+- [`odp`](https://en.wikipedia.org/wiki/OpenDocument) - OpenDocument for presentations
+- [`xml`](https://en.wikipedia.org/wiki/XML)
+- [`heic`](https://nokiatech.github.io/heif/technical.html)
+- [`cur`](https://en.wikipedia.org/wiki/ICO_(file_format))
+- [`ktx`](https://www.khronos.org/opengles/sdk/tools/KTX/file_format_spec/)
+- [`ape`](https://en.wikipedia.org/wiki/Monkey%27s_Audio) - Monkey's Audio
+- [`wv`](https://en.wikipedia.org/wiki/WavPack) - WavPack
+- [`asf`](https://en.wikipedia.org/wiki/Advanced_Systems_Format) - Advanced Systems Format
+- [`wma`](https://en.wikipedia.org/wiki/Windows_Media_Audio) - Windows Media Audio
+- [`wmv`](https://en.wikipedia.org/wiki/Windows_Media_Video) - Windows Media Video
+- [`dcm`](https://en.wikipedia.org/wiki/DICOM#Data_format) - DICOM Image File
+- [`mpc`](https://en.wikipedia.org/wiki/Musepack) - Musepack (SV7 & SV8)
+- [`ics`](https://en.wikipedia.org/wiki/ICalendar#Data_format) - iCalendar
+- [`glb`](https://github.com/KhronosGroup/glTF) - GL Transmission Format
+- [`pcap`](https://wiki.wireshark.org/Development/LibpcapFileFormat) - Libpcap File Format
+- [`dsf`](https://dsd-guide.com/sites/default/files/white-papers/DSFFileFormatSpec_E.pdf) - Sony DSD Stream File (DSF)
+- [`lnk`](https://en.wikipedia.org/wiki/Shortcut_%28computing%29#Microsoft_Windows) - Microsoft Windows file shortcut
+- [`alias`](https://en.wikipedia.org/wiki/Alias_%28Mac_OS%29) - macOS Alias file
+- [`voc`](https://wiki.multimedia.cx/index.php/Creative_Voice) - Creative Voice File
+- [`ac3`](https://www.atsc.org/standard/a522012-digital-audio-compression-ac-3-e-ac-3-standard-12172012/) - ATSC A/52 Audio File
+- [`3gp`](https://en.wikipedia.org/wiki/3GP_and_3G2#3GP) - Multimedia container format defined by the Third Generation Partnership Project (3GPP) for 3G UMTS multimedia services
+- [`3g2`](https://en.wikipedia.org/wiki/3GP_and_3G2#3G2) - Multimedia container format defined by the 3GPP2 for 3G CDMA2000 multimedia services
+- [`m4v`](https://en.wikipedia.org/wiki/M4V) -  MPEG-4 Visual bitstreams
+- [`m4p`](https://en.wikipedia.org/wiki/MPEG-4_Part_14#Filename_extensions) - MPEG-4 files with audio streams encrypted by FairPlay Digital Rights Management as were sold through the iTunes Store
+- [`m4a`](https://en.wikipedia.org/wiki/M4A) - Audio-only MPEG-4 files
+- [`m4b`](https://en.wikipedia.org/wiki/M4B) - Audiobook and podcast MPEG-4 files, which also contain metadata including chapter markers, images, and hyperlinks
+- [`f4v`](https://en.wikipedia.org/wiki/Flash_Video) - ISO base media file format used by Adobe Flash Player
+- [`f4p`](https://en.wikipedia.org/wiki/Flash_Video) - ISO base media file format protected by Adobe Access DRM used by Adobe Flash Player
+- [`f4a`](https://en.wikipedia.org/wiki/Flash_Video) - Audio-only ISO base media file format used by Adobe Flash Player
+- [`f4b`](https://en.wikipedia.org/wiki/Flash_Video) - Audiobook and podcast ISO base media file format used by Adobe Flash Player
+- [`mie`](https://en.wikipedia.org/wiki/Sidecar_file) - Dedicated meta information format which supports storage of binary as well as textual meta information
+- [`shp`](https://en.wikipedia.org/wiki/Shapefile) - Geospatial vector data format
+- [`arrow`](https://arrow.apache.org) - Columnar format for tables of data
+
+*SVG isn't included as it requires the whole file to be read, but you can get it [here](https://github.com/sindresorhus/is-svg).*
+
+*Pull requests are welcome for additional commonly used file types, except for `doc`, `xls`, `ppt`.*
+
+
+## file-type for enterprise
+
+Available as part of the Tidelift Subscription.
+
+The maintainers of file-type and thousands of other packages are working with Tidelift to deliver commercial support and maintenance for the open source dependencies you use to build your applications. Save time, reduce risk, and improve code health, while paying the maintainers of the exact dependencies you use. [Learn more.](https://tidelift.com/subscription/pkg/npm-file-type?utm_source=npm-file-type&utm_medium=referral&utm_campaign=enterprise&utm_term=repo)
+
+
+## Related
+
+- [file-type-cli](https://github.com/sindresorhus/file-type-cli) - CLI for this module
+
+
+## Maintainers
+
+- [Sindre Sorhus](https://github.com/sindresorhus)
+- [Mikael Finstad](https://github.com/mifi)
+- [Ben Brook](https://github.com/bencmbrook)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         'use strict';
+const {
+	multiByteIndexOf,
+	stringToBytes,
+	readUInt64LE,
+	tarHeaderChecksumMatches,
+	uint8ArrayUtf8ByteString
+} = require('./util');
+const supported = require('./supported');
+
+const xpiZipFilename = stringToBytes('META-INF/mozilla.rsa');
+const oxmlContentTypes = stringToBytes('[Content_Types].xml');
+const oxmlRels = stringToBytes('_rels/.rels');
+
+const fileType = input => {
+	if (!(input instanceof Uint8Array || input instanceof ArrayBuffer || Buffer.isBuffer(input))) {
+		throw new TypeError(`Expected the \`input\` argument to be of type \`Uint8Array\` or \`Buffer\` or \`ArrayBuffer\`, got \`${typeof input}\``);
+	}
+
+	const buffer = input instanceof Uint8Array ? input : new Uint8Array(input);
+
+	if (!(buffer && buffer.length > 1)) {
+		return;
+	}
+
+	const check = (header, options) => {
+		options = {
+			offset: 0,
+			...options
+		};
+
+		for (let i = 0; i < header.length; i++) {
+			// If a bitmask is set
+			if (options.mask) {
+				// If header doesn't equal `buf` with bits masked off
+				if (header[i] !== (options.mask[i] & buffer[i + options.offset])) {
+					return false;
+				}
+			} else if (header[i] !== buffer[i + options.offset]) {
+				return false;
+			}
+		}
+
+		return true;
+	};
+
+	const checkString = (header, options) => check(stringToBytes(header), options);
+
+	if (check([0xFF, 0xD8, 0xFF])) {
+		return {
+			ext: 'jpg',
+			mime: 'image/jpeg'
+		};
+	}
+
+	if (check([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) {
+		// APNG format (https://wiki.mozilla.org/APNG_Specification)
+		// 1. Find the first IDAT (image data) chunk (49 44 41 54)
+		// 2. Check if there is an "acTL" chunk before the IDAT one (61 63 54 4C)
+
+		// Offset calculated as follows:
+		// - 8 bytes: PNG signature
+		// - 4 (length) + 4 (chunk type) + 13 (chunk data) + 4 (CRC): IHDR chunk
+		const startIndex = 33;
+		const firstImageDataChunkIndex = buffer.findIndex((el, i) => i >= startIndex && buffer[i] === 0x49 && buffer[i + 1] === 0x44 && buffer[i + 2] === 0x41 && buffer[i + 3] === 0x54);
+		const sliced = buffer.subarray(startIndex, firstImageDataChunkIndex);
+
+		if (sliced.findIndex((el, i) => sliced[i] === 0x61 && sliced[i + 1] === 0x63 && sliced[i + 2] === 0x54 && sliced[i + 3] === 0x4C) >= 0) {
+			return {
+				ext: 'apng',
+				mime: 'image/apng'
+			};
+		}
+
+		return {
+			ext: 'png',
+			mime: 'image/png'
+		};
+	}
+
+	if (check([0x47, 0x49, 0x46])) {
+		return {
+			ext: 'gif',
+			mime: 'image/gif'
+		};
+	}
+
+	if (check([0x57, 0x45, 0x42, 0x50], {offset: 8})) {
+		return {
+			ext: 'webp',
+			mime: 'image/webp'
+		};
+	}
+
+	if (check([0x46, 0x4C, 0x49, 0x46])) {
+		return {
+			ext: 'flif',
+			mime: 'image/flif'
+		};
+	}
+
+	// `cr2`, `orf`, and `arw` need to be before `tif` check
+	if (
+		(check([0x49, 0x49, 0x2A, 0x0]) || check([0x4D, 0x4D, 0x0, 0x2A])) &&
+		check([0x43, 0x52], {offset: 8})
+	) {
+		return {
+			ext: 'cr2',
+			mime: 'image/x-canon-cr2'
+		};
+	}
+
+	if (check([0x49, 0x49, 0x52, 0x4F, 0x08, 0x00, 0x00, 0x00, 0x18])) {
+		return {
+			ext: 'orf',
+			mime: 'image/x-olympus-orf'
+		};
+	}
+
+	if (
+		check([0x49, 0x49, 0x2A, 0x00]) &&
+		(check([0x10, 0xFB, 0x86, 0x01], {offset: 4}) || check([0x08, 0x00, 0x00, 0x00], {offset: 4})) &&
+		// This pattern differentiates ARW from other TIFF-ish file types:
+		check([0x00, 0xFE, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01], {offset: 9})
+	) {
+		return {
+			ext: 'arw',
+			mime: 'image/x-sony-arw'
+		};
+	}
+
+	if (
+		check([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]) &&
+		(check([0x2D, 0x00, 0xFE, 0x00], {offset: 8}) ||
+		check([0x27, 0x00, 0xFE, 0x00], {offset: 8}))
+	) {
+		return {
+			ext: 'dng',
+			mime: 'image/x-adobe-dng'
+		};
+	}
+
+	if (
+		check([0x49, 0x49, 0x2A, 0x00]) &&
+		check([0x1C, 0x00, 0xFE, 0x00], {offset: 8})
+	) {
+		return {
+			ext: 'nef',
+			mime: 'image/x-nikon-nef'
+		};
+	}
+
+	if (check([0x49, 0x49, 0x55, 0x00, 0x18, 0x00, 0x00, 0x00, 0x88, 0xE7, 0x74, 0xD8])) {
+		return {
+			ext: 'rw2',
+			mime: 'image/x-panasonic-rw2'
+		};
+	}
+
+	// `raf` is here just to keep all the raw image detectors together.
+	if (checkString('FUJIFILMCCD-RAW')) {
+		return {
+			ext: 'raf',
+			mime: 'image/x-fujifilm-raf'
+		};
+	}
+
+	if (
+		check([0x49, 0x49, 0x2A, 0x0]) ||
+		check([0x4D, 0x4D, 0x0, 0x2A])
+	) {
+		return {
+			ext: 'tif',
+			mime: 'image/tiff'
+		};
+	}
+
+	if (check([0x42, 0x4D])) {
+		return {
+			ext: 'bmp',
+			mime: 'image/bmp'
+		};
+	}
+
+	if (check([0x49, 0x49, 0xBC])) {
+		return {
+			ext: 'jxr',
+			mime: 'image/vnd.ms-photo'
+		};
+	}
+
+	if (check([0x38, 0x42, 0x50, 0x53])) {
+		return {
+			ext: 'psd',
+			mime: 'image/vnd.adobe.photoshop'
+		};
+	}
+
+	// Zip-based file formats
+	// Need to be before the `zip` check
+	const zipHeader = [0x50, 0x4B, 0x3, 0x4];
+	if (check(zipHeader)) {
+		if (
+			check([0x6D, 0x69, 0x6D, 0x65, 0x74, 0x79, 0x70, 0x65, 0x61, 0x70, 0x70, 0x6C, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6F, 0x6E, 0x2F, 0x65, 0x70, 0x75, 0x62, 0x2B, 0x7A, 0x69, 0x70], {offset: 30})
+		) {
+			return {
+				ext: 'epub',
+				mime: 'application/epub+zip'
+			};
+		}
+
+		// Assumes signed `.xpi` from addons.mozilla.org
+		if (check(xpiZipFilename, {offset: 30})) {
+			return {
+				ext: 'xpi',
+				mime: 'application/x-xpinstall'
+			};
+		}
+
+		if (checkString('mimetypeapplication/vnd.oasis.opendocument.text', {offset: 30})) {
+			return {
+				ext: 'odt',
+				mime: 'application/vnd.oasis.opendocument.text'
+			};
+		}
+
+		if (checkString('mimetypeapplication/vnd.oasis.opendocument.spreadsheet', {offset: 30})) {
+			return {
+				ext: 'ods',
+				mime: 'application/vnd.oasis.opendocument.spreadsheet'
+			};
+		}
+
+		if (checkString('mimetypeapplication/vnd.oasis.opendocument.presentation', {offset: 30})) {
+			return {
+				ext: 'odp',
+				mime: 'application/vnd.oasis.opendocument.presentation'
+			};
+		}
+
+		// The docx, xlsx and pptx file types extend the Office Open XML file format:
+		// https://en.wikipedia.org/wiki/Office_Open_XML_file_formats
+		// We look for:
+		// - one entry named '[Content_Types].xml' or '_rels/.rels',
+		// - one entry indicating specific type of file.
+		// MS Office, OpenOffice and LibreOffice may put the parts in different order, so the check should not rely on it.
+		let zipHeaderIndex = 0; // The first zip header was already found at index 0
+		let oxmlFound = false;
+		let type;
+
+		do {
+			const offset = zipHeaderIndex + 30;
+
+			if (!oxmlFound) {
+				oxmlFound = (check(oxmlContentTypes, {offset}) || check(oxmlRels, {offset}));
+			}
+
+			if (!type) {
+				if (checkString('word/', {offset})) {
+					type = {
+						ext: 'docx',
+						mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+					};
+				} else if (checkString('ppt/', {offset})) {
+					type = {
+						ext: 'pptx',
+						mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+					};
+				} else if (checkString('xl/', {offset})) {
+					type = {
+						ext: 'xlsx',
+						mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+					};
+				}
+			}
+
+			if (oxmlFound && type) {
+				return type;
+			}
+
+			zipHeaderIndex = multiByteIndexOf(buffer, zipHeader, offset);
+		} while (zipHeaderIndex >= 0);
+
+		// No more zip parts available in the buffer, but maybe we are almost certain about the type?
+		if (type) {
+			return type;
+		}
+	}
+
+	if (
+		check([0x50, 0x4B]) &&
+		(buffer[2] === 0x3 || buffer[2] === 0x5 || buffer[2] === 0x7) &&
+		(buffer[3] === 0x4 || buffer[3] === 0x6 || buffer[3] === 0x8)
+	) {
+		return {
+			ext: 'zip',
+			mime: 'application/zip'
+		};
+	}
+
+	if (
+		check([0x30, 0x30, 0x30, 0x30, 0x30, 0x30], {offset: 148, mask: [0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8]}) && // Valid tar checksum
+		tarHeaderChecksumMatches(buffer)
+	) {
+		return {
+			ext: 'tar',
+			mime: 'application/x-tar'
+		};
+	}
+
+	if (
+		check([0x52, 0x61, 0x72, 0x21, 0x1A, 0x7]) &&
+		(buffer[6] === 0x0 || buffer[6] === 0x1)
+	) {
+		return {
+			ext: 'rar',
+			mime: 'application/x-rar-compressed'
+		};
+	}
+
+	if (check([0x1F, 0x8B, 0x8])) {
+		return {
+			ext: 'gz',
+			mime: 'application/gzip'
+		};
+	}
+
+	if (check([0x42, 0x5A, 0x68])) {
+		return {
+			ext: 'bz2',
+			mime: 'application/x-bzip2'
+		};
+	}
+
+	if (check([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])) {
+		return {
+			ext: '7z',
+			mime: 'application/x-7z-compressed'
+		};
+	}
+
+	if (check([0x78, 0x01])) {
+		return {
+			ext: 'dmg',
+			mime: 'application/x-apple-diskimage'
+		};
+	}
+
+	// `mov` format variants
+	if (
+		check([0x66, 0x72, 0x65, 0x65], {offset: 4}) || // `free`
+		check([0x6D, 0x64, 0x61, 0x74], {offset: 4}) || // `mdat` MJPEG
+		check([0x6D, 0x6F, 0x6F, 0x76], {offset: 4}) || // `moov`
+		check([0x77, 0x69, 0x64, 0x65], {offset: 4}) // `wide`
+	) {
+		return {
+			ext: 'mov',
+			mime: 'video/quicktime'
+		};
+	}
+
+	// File Type Box (https://en.wikipedia.org/wiki/ISO_base_media_file_format)
+	// It's not required to be first, but it's recommended to be. Almost all ISO base media files start with `ftyp` box.
+	// `ftyp` box must contain a brand major identifier, which must consist of ISO 8859-1 printable characters.
+	// Here we check for 8859-1 printable characters (for simplicity, it's a mask which also catches one non-printable character).
+	if (
+		checkString('ftyp', {offset: 4}) &&
+		(buffer[8] & 0x60) !== 0x00 // Brand major, first character ASCII?
+	) {
+		// They all can have MIME `video/mp4` except `application/mp4` special-case which is hard to detect.
+		// For some cases, we're specific, everything else falls to `video/mp4` with `mp4` extension.
+		const brandMajor = uint8ArrayUtf8ByteString(buffer, 8, 12).replace('\0', ' ').trim();
+		switch (brandMajor) {
+			case 'mif1':
+				return {ext: 'heic', mime: 'image/heif'};
+			case 'msf1':
+				return {ext: 'heic', mime: 'image/heif-sequence'};
+			case 'heic': case 'heix':
+				return {ext: 'heic', mime: 'image/heic'};
+			case 'hevc': case 'hevx':
+				return {ext: 'heic', mime: 'image/heic-sequence'};
+			case 'qt':
+				return {ext: 'mov', mime: 'video/quicktime'};
+			case 'M4V': case 'M4VH': case 'M4VP':
+				return {ext: 'm4v', mime: 'video/x-m4v'};
+			case 'M4P':
+				return {ext: 'm4p', mime: 'video/mp4'};
+			case 'M4B':
+				return {ext: 'm4b', mime: 'audio/mp4'};
+			case 'M4A':
+				return {ext: 'm4a', mime: 'audio/x-m4a'};
+			case 'F4V':
+				return {ext: 'f4v', mime: 'video/mp4'};
+			case 'F4P':
+				return {ext: 'f4p', mime: 'video/mp4'};
+			case 'F4A':
+				return {ext: 'f4a', mime: 'audio/mp4'};
+			case 'F4B':
+				return {ext: 'f4b', mime: 'audio/mp4'};
+			default:
+				if (brandMajor.startsWith('3g')) {
+					if (brandMajor.startsWith('3g2')) {
+						return {ext: '3g2', mime: 'video/3gpp2'};
+					}
+
+					return {ext: '3gp', mime: 'video/3gpp'};
+				}
+
+				return {ext: 'mp4', mime: 'video/mp4'};
+		}
+	}
+
+	if (check([0x4D, 0x54, 0x68, 0x64])) {
+		return {
+			ext: 'mid',
+			mime: 'audio/midi'
+		};
+	}
+
+	// https://github.com/threatstack/libmagic/blob/master/magic/Magdir/matroska
+	if (check([0x1A, 0x45, 0xDF, 0xA3])) {
+		const sliced = buffer.subarray(4, 4 + 4096);
+		const idPos = sliced.findIndex((el, i, arr) => arr[i] === 0x42 && arr[i + 1] === 0x82);
+
+		if (idPos !== -1) {
+			const docTypePos = idPos + 3;
+			const findDocType = type => [...type].every((c, i) => sliced[docTypePos + i] === c.charCodeAt(0));
+
+			if (findDocType('matroska')) {
+				return {
+					ext: 'mkv',
+					mime: 'video/x-matroska'
+				};
+			}
+
+			if (findDocType('webm')) {
+				return {
+					ext: 'webm',
+					mime: 'video/webm'
+				};
+			}
+		}
+	}
+
+	// RIFF file format which might be AVI, WAV, QCP, etc
+	if (check([0x52, 0x49, 0x46, 0x46])) {
+		if (check([0x41, 0x56, 0x49], {offset: 8})) {
+			return {
+				ext: 'avi',
+				mime: 'video/vnd.avi'
+			};
+		}
+
+		if (check([0x57, 0x41, 0x56, 0x45], {offset: 8})) {
+			return {
+				ext: 'wav',
+				mime: 'audio/vnd.wave'
+			};
+		}
+
+		// QLCM, QCP file
+		if (check([0x51, 0x4C, 0x43, 0x4D], {offset: 8})) {
+			return {
+				ext: 'qcp',
+				mime: 'audio/qcelp'
+			};
+		}
+	}
+
+	// ASF_Header_Object first 80 bytes
+	if (check([0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9])) {
+		// Search for header should be in first 1KB of file.
+
+		let offset = 30;
+		do {
+			const objectSize = readUInt64LE(buffer, offset + 16);
+			if (check([0x91, 0x07, 0xDC, 0xB7, 0xB7, 0xA9, 0xCF, 0x11, 0x8E, 0xE6, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65], {offset})) {
+				// Sync on Stream-Properties-Object (B7DC0791-A9B7-11CF-8EE6-00C00C205365)
+				if (check([0x40, 0x9E, 0x69, 0xF8, 0x4D, 0x5B, 0xCF, 0x11, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44, 0x2B], {offset: offset + 24})) {
+					// Found audio:
+					return {
+						ext: 'wma',
+						mime: 'audio/x-ms-wma'
+					};
+				}
+
+				if (check([0xC0, 0xEF, 0x19, 0xBC, 0x4D, 0x5B, 0xCF, 0x11, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44, 0x2B], {offset: offset + 24})) {
+					// Found video:
+					return {
+						ext: 'wmv',
+						mime: 'video/x-ms-asf'
+					};
+				}
+
+				break;
+			}
+
+			offset += objectSize;
+		} while (offset + 24 <= buffer.length);
+
+		// Default to ASF generic extension
+		return {
+			ext: 'asf',
+			mime: 'application/vnd.ms-asf'
+		};
+	}
+
+	if (
+		check([0x0, 0x0, 0x1, 0xBA]) ||
+		check([0x0, 0x0, 0x1, 0xB3])
+	) {
+		return {
+			ext: 'mpg',
+			mime: 'video/mpeg'
+		};
+	}
+
+	// Check for MPEG header at different starting offsets
+	for (let start = 0; start < 2 && start < (buffer.length - 16); start++) {
+		if (
+			check([0x49, 0x44, 0x33], {offset: start}) || // ID3 header
+			check([0xFF, 0xE2], {offset: start, mask: [0xFF, 0xE6]}) // MPEG 1 or 2 Layer 3 header
+		) {
+			return {
+				ext: 'mp3',
+				mime: 'audio/mpeg'
+			};
+		}
+
+		if (
+			check([0xFF, 0xE4], {offset: start, mask: [0xFF, 0xE6]}) // MPEG 1 or 2 Layer 2 header
+		) {
+			return {
+				ext: 'mp2',
+				mime: 'audio/mpeg'
+			};
+		}
+
+		if (
+			check([0xFF, 0xF8], {offset: start, mask: [0xFF, 0xFC]}) // MPEG 2 layer 0 using ADTS
+		) {
+			return {
+				ext: 'mp2',
+				mime: 'audio/mpeg'
+			};
+		}
+
+		if (
+			check([0xFF, 0xF0], {offset: start, mask: [0xFF, 0xFC]}) // MPEG 4 layer 0 using ADTS
+		) {
+			return {
+				ext: 'mp4',
+				mime: 'audio/mpeg'
+			};
+		}
+	}
+
+	// Needs to be before `ogg` check
+	if (check([0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], {offset: 28})) {
+		return {
+			ext: 'opus',
+			mime: 'audio/opus'
+		};
+	}
+
+	// If 'OggS' in first  bytes, then OGG container
+	if (check([0x4F, 0x67, 0x67, 0x53])) {
+		// This is a OGG container
+
+		// If ' theora' in header.
+		if (check([0x80, 0x74, 0x68, 0x65, 0x6F, 0x72, 0x61], {offset: 28})) {
+			return {
+				ext: 'ogv',
+				mime: 'video/ogg'
+			};
+		}
+
+		// If '\x01video' in header.
+		if (check([0x01, 0x76, 0x69, 0x64, 0x65, 0x6F, 0x00], {offset: 28})) {
+			return {
+				ext: 'ogm',
+				mime: 'video/ogg'
+			};
+		}
+
+		// If ' FLAC' in header  https://xiph.org/flac/faq.html
+		if (check([0x7F, 0x46, 0x4C, 0x41, 0x43], {offset: 28})) {
+			return {
+				ext: 'oga',
+				mime: 'audio/ogg'
+			};
+		}
+
+		// 'Speex  ' in header https://en.wikipedia.org/wiki/Speex
+		if (check([0x53, 0x70, 0x65, 0x65, 0x78, 0x20, 0x20], {offset: 28})) {
+			return {
+				ext: 'spx',
+				mime: 'audio/ogg'
+			};
+		}
+
+		// If '\x01vorbis' in header
+		if (check([0x01, 0x76, 0x6F, 0x72, 0x62, 0x69, 0x73], {offset: 28})) {
+			return {
+				ext: 'ogg',
+				mime: 'audio/ogg'
+			};
+		}
+
+		// Default OGG container https://www.iana.org/assignments/media-types/application/ogg
+		return {
+			ext: 'ogx',
+			mime: 'application/ogg'
+		};
+	}
+
+	if (check([0x66, 0x4C, 0x61, 0x43])) {
+		return {
+			ext: 'flac',
+			mime: 'audio/x-flac'
+		};
+	}
+
+	if (check([0x4D, 0x41, 0x43, 0x20])) { // 'MAC '
+		return {
+			ext: 'ape',
+			mime: 'audio/ape'
+		};
+	}
+
+	if (check([0x77, 0x76, 0x70, 0x6B])) { // 'wvpk'
+		return {
+			ext: 'wv',
+			mime: 'audio/wavpack'
+		};
+	}
+
+	if (check([0x23, 0x21, 0x41, 0x4D, 0x52, 0x0A])) {
+		return {
+			ext: 'amr',
+			mime: 'audio/amr'
+		};
+	}
+
+	if (check([0x25, 0x50, 0x44, 0x46])) {
+		return {
+			ext: 'pdf',
+			mime: 'application/pdf'
+		};
+	}
+
+	if (check([0x4D, 0x5A])) {
+		return {
+			ext: 'exe',
+			mime: 'application/x-msdownload'
+		};
+	}
+
+	if (
+		(buffer[0] === 0x43 || buffer[0] === 0x46) &&
+		check([0x57, 0x53], {offset: 1})
+	) {
+		return {
+			ext: 'swf',
+			mime: 'application/x-shockwave-flash'
+		};
+	}
+
+	if (check([0x7B, 0x5C, 0x72, 0x74, 0x66])) {
+		return {
+			ext: 'rtf',
+			mime: 'application/rtf'
+		};
+	}
+
+	if (check([0x00, 0x61, 0x73, 0x6D])) {
+		return {
+			ext: 'wasm',
+			mime: 'application/wasm'
+		};
+	}
+
+	if (
+		check([0x77, 0x4F, 0x46, 0x46]) &&
+		(
+			check([0x00, 0x01, 0x00, 0x00], {offset: 4}) ||
+			check([0x4F, 0x54, 0x54, 0x4F], {offset: 4})
+		)
+	) {
+		return {
+			ext: 'woff',
+			mime: 'font/woff'
+		};
+	}
+
+	if (
+		check([0x77, 0x4F, 0x46, 0x32]) &&
+		(
+			check([0x00, 0x01, 0x00, 0x00], {offset: 4}) ||
+			check([0x4F, 0x54, 0x54, 0x4F], {offset: 4})
+		)
+	) {
+		return {
+			ext: 'woff2',
+			mime: 'font/woff2'
+		};
+	}
+
+	if (
+		check([0x4C, 0x50], {offset: 34}) &&
+		(
+			check([0x00, 0x00, 0x01], {offset: 8}) ||
+			check([0x01, 0x00, 0x02], {offset: 8}) ||
+			check([0x02, 0x00, 0x02], {offset: 8})
+		)
+	) {
+		return {
+			ext: 'eot',
+			mime: 'application/vnd.ms-fontobject'
+		};
+	}
+
+	if (check([0x00, 0x01, 0x00, 0x00, 0x00])) {
+		return {
+			ext: 'ttf',
+			mime: 'font/ttf'
+		};
+	}
+
+	if (check([0x4F, 0x54, 0x54, 0x4F, 0x00])) {
+		return {
+			ext: 'otf',
+			mime: 'font/otf'
+		};
+	}
+
+	if (check([0x00, 0x00, 0x01, 0x00])) {
+		return {
+			ext: 'ico',
+			mime: 'image/x-icon'
+		};
+	}
+
+	if (check([0x00, 0x00, 0x02, 0x00])) {
+		return {
+			ext: 'cur',
+			mime: 'image/x-icon'
+		};
+	}
+
+	if (check([0x46, 0x4C, 0x56, 0x01])) {
+		return {
+			ext: 'flv',
+			mime: 'video/x-flv'
+		};
+	}
+
+	if (check([0x25, 0x21])) {
+		return {
+			ext: 'ps',
+			mime: 'application/postscript'
+		};
+	}
+
+	if (check([0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00])) {
+		return {
+			ext: 'xz',
+			mime: 'application/x-xz'
+		};
+	}
+
+	if (check([0x53, 0x51, 0x4C, 0x69])) {
+		return {
+			ext: 'sqlite',
+			mime: 'application/x-sqlite3'
+		};
+	}
+
+	if (check([0x4E, 0x45, 0x53, 0x1A])) {
+		return {
+			ext: 'nes',
+			mime: 'application/x-nintendo-nes-rom'
+		};
+	}
+
+	if (check([0x43, 0x72, 0x32, 0x34])) {
+		return {
+			ext: 'crx',
+			mime: 'application/x-google-chrome-extension'
+		};
+	}
+
+	if (
+		check([0x4D, 0x53, 0x43, 0x46]) ||
+		check([0x49, 0x53, 0x63, 0x28])
+	) {
+		return {
+			ext: 'cab',
+			mime: 'application/vnd.ms-cab-compressed'
+		};
+	}
+
+	// Needs to be before `ar` check
+	if (check([0x21, 0x3C, 0x61, 0x72, 0x63, 0x68, 0x3E, 0x0A, 0x64, 0x65, 0x62, 0x69, 0x61, 0x6E, 0x2D, 0x62, 0x69, 0x6E, 0x61, 0x72, 0x79])) {
+		return {
+			ext: 'deb',
+			mime: 'application/x-deb'
+		};
+	}
+
+	if (check([0x21, 0x3C, 0x61, 0x72, 0x63, 0x68, 0x3E])) {
+		return {
+			ext: 'ar',
+			mime: 'application/x-unix-archive'
+		};
+	}
+
+	if (check([0xED, 0xAB, 0xEE, 0xDB])) {
+		return {
+			ext: 'rpm',
+			mime: 'application/x-rpm'
+		};
+	}
+
+	if (
+		check([0x1F, 0xA0]) ||
+		check([0x1F, 0x9D])
+	) {
+		return {
+			ext: 'Z',
+			mime: 'application/x-compress'
+		};
+	}
+
+	if (check([0x4C, 0x5A, 0x49, 0x50])) {
+		return {
+			ext: 'lz',
+			mime: 'application/x-lzip'
+		};
+	}
+
+	if (check([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3E])) {
+		return {
+			ext: 'msi',
+			mime: 'application/x-msi'
+		};
+	}
+
+	if (check([0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01, 0x01, 0x02])) {
+		return {
+			ext: 'mxf',
+			mime: 'application/mxf'
+		};
+	}
+
+	if (check([0x47], {offset: 4}) && (check([0x47], {offset: 192}) || check([0x47], {offset: 196}))) {
+		return {
+			ext: 'mts',
+			mime: 'video/mp2t'
+		};
+	}
+
+	if (check([0x42, 0x4C, 0x45, 0x4E, 0x44, 0x45, 0x52])) {
+		return {
+			ext: 'blend',
+			mime: 'application/x-blender'
+		};
+	}
+
+	if (check([0x42, 0x50, 0x47, 0xFB])) {
+		return {
+			ext: 'bpg',
+			mime: 'image/bpg'
+		};
+	}
+
+	if (check([0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A])) {
+		// JPEG-2000 family
+
+		if (check([0x6A, 0x70, 0x32, 0x20], {offset: 20})) {
+			return {
+				ext: 'jp2',
+				mime: 'image/jp2'
+			};
+		}
+
+		if (check([0x6A, 0x70, 0x78, 0x20], {offset: 20})) {
+			return {
+				ext: 'jpx',
+				mime: 'image/jpx'
+			};
+		}
+
+		if (check([0x6A, 0x70, 0x6D, 0x20], {offset: 20})) {
+			return {
+				ext: 'jpm',
+				mime: 'image/jpm'
+			};
+		}
+
+		if (check([0x6D, 0x6A, 0x70, 0x32], {offset: 20})) {
+			return {
+				ext: 'mj2',
+				mime: 'image/mj2'
+			};
+		}
+	}
+
+	if (check([0x46, 0x4F, 0x52, 0x4D])) {
+		return {
+			ext: 'aif',
+			mime: 'audio/aiff'
+		};
+	}
+
+	if (checkString('<?xml ')) {
+		return {
+			ext: 'xml',
+			mime: 'application/xml'
+		};
+	}
+
+	if (check([0x42, 0x4F, 0x4F, 0x4B, 0x4D, 0x4F, 0x42, 0x49], {offset: 60})) {
+		return {
+			ext: 'mobi',
+			mime: 'application/x-mobipocket-ebook'
+		};
+	}
+
+	if (check([0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A])) {
+		return {
+			ext: 'ktx',
+			mime: 'image/ktx'
+		};
+	}
+
+	if (check([0x44, 0x49, 0x43, 0x4D], {offset: 128})) {
+		return {
+			ext: 'dcm',
+			mime: 'application/dicom'
+		};
+	}
+
+	// Musepack, SV7
+	if (check([0x4D, 0x50, 0x2B])) {
+		return {
+			ext: 'mpc',
+			mime: 'audio/x-musepack'
+		};
+	}
+
+	// Musepack, SV8
+	if (check([0x4D, 0x50, 0x43, 0x4B])) {
+		return {
+			ext: 'mpc',
+			mime: 'audio/x-musepack'
+		};
+	}
+
+	if (check([0x42, 0x45, 0x47, 0x49, 0x4E, 0x3A])) {
+		return {
+			ext: 'ics',
+			mime: 'text/calendar'
+		};
+	}
+
+	if (check([0x67, 0x6C, 0x54, 0x46, 0x02, 0x00, 0x00, 0x00])) {
+		return {
+			ext: 'glb',
+			mime: 'model/gltf-binary'
+		};
+	}
+
+	if (check([0xD4, 0xC3, 0xB2, 0xA1]) || check([0xA1, 0xB2, 0xC3, 0xD4])) {
+		return {
+			ext: 'pcap',
+			mime: 'application/vnd.tcpdump.pcap'
+		};
+	}
+
+	// Sony DSD Stream File (DSF)
+	if (check([0x44, 0x53, 0x44, 0x20])) {
+		return {
+			ext: 'dsf',
+			mime: 'audio/x-dsf' // Non-standard
+		};
+	}
+
+	if (check([0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46])) {
+		return {
+			ext: 'lnk',
+			mime: 'application/x.ms.shortcut' // Invented by us
+		};
+	}
+
+	if (check([0x62, 0x6F, 0x6F, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x6D, 0x61, 0x72, 0x6B, 0x00, 0x00, 0x00, 0x00])) {
+		return {
+			ext: 'alias',
+			mime: 'application/x.apple.alias' // Invented by us
+		};
+	}
+
+	if (checkString('Creative Voice File')) {
+		return {
+			ext: 'voc',
+			mime: 'audio/x-voc'
+		};
+	}
+
+	if (check([0x0B, 0x77])) {
+		return {
+			ext: 'ac3',
+			mime: 'audio/vnd.dolby.dd-raw'
+		};
+	}
+
+	if ((check([0x7E, 0x10, 0x04]) || check([0x7E, 0x18, 0x04])) && check([0x30, 0x4D, 0x49, 0x45], {offset: 4})) {
+		return {
+			ext: 'mie',
+			mime: 'application/x-mie'
+		};
+	}
+
+	if (check([0x41, 0x52, 0x52, 0x4F, 0x57, 0x31, 0x00, 0x00])) {
+		return {
+			ext: 'arrow',
+			mime: 'application/x-apache-arrow'
+		};
+	}
+
+	if (check([0x27, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], {offset: 2})) {
+		return {
+			ext: 'shp',
+			mime: 'application/x-esri-shape'
+		};
+	}
+};
+
+module.exports = fileType;
+
+Object.defineProperty(fileType, 'minimumBytes', {value: 4100});
+
+fileType.stream = readableStream => new Promise((resolve, reject) => {
+	// Using `eval` to work around issues when bundling with Webpack
+	const stream = eval('require')('stream'); // eslint-disable-line no-eval
+
+	readableStream.on('error', reject);
+	readableStream.once('readable', () => {
+		const pass = new stream.PassThrough();
+		const chunk = readableStream.read(module.exports.minimumBytes) || readableStream.read();
+		try {
+			pass.fileType = fileType(chunk);
+		} catch (error) {
+			reject(error);
+		}
+
+		readableStream.unshift(chunk);
+
+		if (stream.pipeline) {
+			resolve(stream.pipeline(readableStream, pass, () => {}));
+		} else {
+			resolve(readableStream.pipe(pass));
+		}
+	});
+});
+
+Object.defineProperty(fileType, 'extensions', {
+	get() {
+		return new Set(supported.extensions);
+	}
+});
+
+Object.defineProperty(fileType, 'mimeTypes', {
+	get() {
+		return new Set(supported.mimeTypes);
+	}
+});
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      <div align="center">
+  <a href="https://github.com/webpack/webpack">
+    <img width="200" height="200" src="https://webpack.js.org/assets/icon-square-big.svg">
+  </a>
+</div>
+
+[![npm][npm]][npm-url]
+[![node][node]][node-url]
+[![deps][deps]][deps-url]
+[![tests][tests]][tests-url]
+[![coverage][cover]][cover-url]
+[![chat][chat]][chat-url]
+[![size][size]][size-url]
+
+# file-loader
+
+The `file-loader` resolves `import`/`require()` on a file into a url and emits the file into the output directory.
+
+## Getting Started
+
+To begin, you'll need to install `file-loader`:
+
+```console
+$ npm install file-loader --save-dev
+```
+
+Import (or `require`) the target file(s) in one of the bundle's files:
+
+**file.js**
+
+```js
+import img from './file.png';
+```
+
+Then add the loader to your `webpack` config. For example:
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        use: [
+          {
+            loader: 'file-loader',
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+And run `webpack` via your preferred method. This will emit `file.png` as a file
+in the output directory (with the specified naming convention, if options are
+specified to do so) and returns the public URI of the file.
+
+> ℹ️ By default the filename of the resulting file is the hash of the file's contents with the original extension of the required resource.
+
+## Options
+
+### `name`
+
+Type: `String|Function`
+Default: `'[contenthash].[ext]'`
+
+Specifies a custom filename template for the target file(s) using the query
+parameter `name`. For example, to emit a file from your `context` directory into
+the output directory retaining the full directory structure, you might use:
+
+#### `String`
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          name: '[path][name].[ext]',
+        },
+      },
+    ],
+  },
+};
+```
+
+#### `Function`
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          name(resourcePath, resourceQuery) {
+            // `resourcePath` - `/absolute/path/to/file.js`
+            // `resourceQuery` - `?foo=bar`
+
+            if (process.env.NODE_ENV === 'development') {
+              return '[path][name].[ext]';
+            }
+
+            return '[contenthash].[ext]';
+          },
+        },
+      },
+    ],
+  },
+};
+```
+
+> ℹ️ By default the path and name you specify will output the file in that same directory, and will also use the same URI path to access the file.
+
+### `outputPath`
+
+Type: `String|Function`
+Default: `undefined`
+
+Specify a filesystem path where the target file(s) will be placed.
+
+#### `String`
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          outputPath: 'images',
+        },
+      },
+    ],
+  },
+};
+```
+
+#### `Function`
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          outputPath: (url, resourcePath, context) => {
+            // `resourcePath` is original absolute path to asset
+            // `context` is directory where stored asset (`rootContext`) or `context` option
+
+            // To get relative path you can use
+            // const relativePath = path.relative(context, resourcePath);
+
+            if (/my-custom-image\.png/.test(resourcePath)) {
+              return `other_output_path/${url}`;
+            }
+
+            if (/images/.test(context)) {
+              return `image_output_path/${url}`;
+            }
+
+            return `output_path/${url}`;
+          },
+        },
+      },
+    ],
+  },
+};
+```
+
+### `publicPath`
+
+Type: `String|Function`
+Default: [`__webpack_public_path__`](https://webpack.js.org/api/module-variables/#__webpack_public_path__-webpack-specific-)+outputPath
+
+Specifies a custom public path for the target file(s).
+
+#### `String`
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          publicPath: 'assets',
+        },
+      },
+    ],
+  },
+};
+```
+
+#### `Function`
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          publicPath: (url, resourcePath, context) => {
+            // `resourcePath` is original absolute path to asset
+            // `context` is directory where stored asset (`rootContext`) or `context` option
+
+            // To get relative path you can use
+            // const relativePath = path.relative(context, resourcePath);
+
+            if (/my-custom-image\.png/.test(resourcePath)) {
+              return `other_public_path/${url}`;
+            }
+
+            if (/images/.test(context)) {
+              return `image_output_path/${url}`;
+            }
+
+            return `public_path/${url}`;
+          },
+        },
+      },
+    ],
+  },
+};
+```
+
+### `postTransformPublicPath`
+
+Type: `Function`
+Default: `undefined`
+
+Specifies a custom function to post-process the generated public path. This can be used to prepend or append dynamic global variables that are only available at runtime, like `__webpack_public_path__`. This would not be possible with just `publicPath`, since it stringifies the values.
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpg|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          publicPath: '/some/path/',
+          postTransformPublicPath: (p) => `__webpack_public_path__ + ${p}`,
+        },
+      },
+    ],
+  },
+};
+```
+
+### `context`
+
+Type: `String`
+Default: [`context`](https://webpack.js.org/configuration/entry-context/#context)
+
+Specifies a custom file context.
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              context: 'project',
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+### `emitFile`
+
+Type: `Boolean`
+Default: `true`
+
+If true, emits a file (writes a file to the filesystem). If false, the loader
+will return a public URI but **will not** emit the file. It is often useful to
+disable this option for server-side packages.
+
+**file.js**
+
+```js
+// bundle file
+import img from './file.png';
+```
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.css$/i,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              emitFile: false,
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+### `regExp`
+
+Type: `RegExp`
+Default: `undefined`
+
+Specifies a Regular Expression to one or many parts of the target file path.
+The capture groups can be reused in the `name` property using `[N]`
+[placeholder](https://github.com/webpack-contrib/file-loader#placeholders).
+
+**file.js**
+
+```js
+import img from './customer01/file.png';
+```
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              regExp: /\/([a-z0-9]+)\/[a-z0-9]+\.png$/i,
+              name: '[1]-[name].[ext]',
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+> ℹ️ If `[0]` is used, it will be replaced by the entire tested string, whereas `[1]` will contain the first capturing parenthesis of your regex and so on...
+
+### `esModule`
+
+Type: `Boolean`
+Default: `true`
+
+By default, `file-loader` generates JS modules that use the ES modules syntax.
+There are some cases in which using ES modules is beneficial, like in the case of [module concatenation](https://webpack.js.org/plugins/module-concatenation-plugin/) and [tree shaking](https://webpack.js.org/guides/tree-shaking/).
+
+You can enable a CommonJS module syntax using:
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.css$/,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              esModule: false,
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+## Placeholders
+
+Full information about placeholders you can find [here](https://github.com/webpack/loader-utils#interpolatename).
+
+### `[ext]`
+
+Type: `String`
+Default: `file.extname`
+
+The file extension of the target file/resource.
+
+### `[name]`
+
+Type: `String`
+Default: `file.basename`
+
+The basename of the file/resource.
+
+### `[path]`
+
+Type: `String`
+Default: `file.directory`
+
+The path of the resource relative to the webpack/config `context`.
+
+### `[folder]`
+
+Type: `String`
+Default: `file.folder`
+
+The folder of the resource is in.
+
+### `[query]`
+
+Type: `String`
+Default: `file.query`
+
+The query of the resource, i.e. `?foo=bar`.
+
+### `[emoji]`
+
+Type: `String`
+Default: `undefined`
+
+A random emoji representation of `content`.
+
+### `[emoji:<length>]`
+
+Type: `String`
+Default: `undefined`
+
+Same as above, but with a customizable number of emojis
+
+### `[hash]`
+
+Type: `String`
+Default: `md4`
+
+Specifies the hash method to use for hashing the file content.
+
+### `[contenthash]`
+
+Type: `String`
+Default: `md4`
+
+Specifies the hash method to use for hashing the file content.
+
+### `[<hashType>:hash:<digestType>:<length>]`
+
+Type: `String`
+
+The hash of options.content (Buffer) (by default it's the hex digest of the hash).
+
+#### `digestType`
+
+Type: `String`
+Default: `'hex'`
+
+The [digest](https://en.wikipedia.org/wiki/Cryptographic_hash_function) that the
+hash function should use. Valid values include: base26, base32, base36,
+base49, base52, base58, base62, base64, and hex.
+
+#### `hashType`
+
+Type: `String`
+Default: `'md4'`
+
+The type of hash that the has function should use. Valid values include: `md4`, `md5`, `sha1`, `sha256`, and `sha512`.
+
+#### `length`
+
+Type: `Number`
+Default: `undefined`
+
+Users may also specify a length for the computed hash.
+
+### `[N]`
+
+Type: `String`
+Default: `undefined`
+
+The n-th match obtained from matching the current file name against the `regExp`.
+
+## Examples
+
+### Names
+
+The following examples show how one might use `file-loader` and what the result would be.
+
+**file.js**
+
+```js
+import png from './image.png';
+```
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              name: 'dirname/[contenthash].[ext]',
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+Result:
+
+```bash
+# result
+dirname/0dcbbaa701328ae351f.png
+```
+
+---
+
+**file.js**
+
+```js
+import png from './image.png';
+```
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              name: '[sha512:hash:base64:7].[ext]',
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+Result:
+
+```bash
+# result
+gdyb21L.png
+```
+
+---
+
+**file.js**
+
+```js
+import png from './path/to/file.png';
+```
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              name: '[path][name].[ext]?[contenthash]',
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+Result:
+
+```bash
+# result
+path/to/file.png?e43b20c069c4a01867c31e98cbce33c9
+```
+
+### CDN
+
+The following examples show how to use `file-loader` for CDN uses query params.
+
+**file.js**
+
+```js
+import png from './directory/image.png?width=300&height=300';
+```
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  output: {
+    publicPath: 'https://cdn.example.com/',
+  },
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpe?g|gif)$/i,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              name: '[path][name].[ext][query]',
+            },
+          },
+        ],
+      },
+    ],
+  },
+};
+```
+
+Result:
+
+```bash
+# result
+https://cdn.example.com/directory/image.png?width=300&height=300
+```
+
+### Dynamic public path depending on environment variable at run time
+
+An application might want to configure different CDN hosts depending on an environment variable that is only available when running the application. This can be an advantage, as only one build of the application is necessary, which behaves differently depending on environment variables of the deployment environment. Since file-loader is applied when compiling the application, and not when running it, the environment variable cannot be used in the file-loader configuration. A way around this is setting the `__webpack_public_path__` to the desired CDN host depending on the environment variable at the entrypoint of the application. The option `postTransformPublicPath` can be used to configure a custom path depending on a variable like `__webpack_public_path__`.
+
+**main.js**
+
+```js
+const assetPrefixForNamespace = (namespace) => {
+  switch (namespace) {
+    case 'prod':
+      return 'https://cache.myserver.net/web';
+    case 'uat':
+      return 'https://cache-uat.myserver.net/web';
+    case 'st':
+      return 'https://cache-st.myserver.net/web';
+    case 'dev':
+      return 'https://cache-dev.myserver.net/web';
+    default:
+      return '';
+  }
+};
+const namespace = process.env.NAMESPACE;
+
+__webpack_public_path__ = `${assetPrefixForNamespace(namespace)}/`;
+```
+
+**file.js**
+
+```js
+import png from './image.png';
+```
+
+**webpack.config.js**
+
+```js
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpg|gif)$/i,
+        loader: 'file-loader',
+        options: {
+          name: '[name].[contenthash].[ext]',
+          outputPath: 'static/assets/',
+          publicPath: 'static/assets/',
+          postTransformPublicPath: (p) => `__webpack_public_path__ + ${p}`,
+        },
+      },
+    ],
+  },
+};
+```
+
+Result when run with `NAMESPACE=prod` env variable:
+
+```bash
+# result
+https://cache.myserver.net/web/static/assets/image.somehash.png
+```
+
+Result when run with `NAMESPACE=dev` env variable:
+
+```bash
+# result
+https://cache-dev.myserver.net/web/static/assets/image.somehash.png
+```
+
+## Contributing
+
+Please take a moment to read our contributing guidelines if you haven't yet done so.
+
+[CONTRIBUTING](./.github/CONTRIBUTING.md)
+
+## License
+
+[MIT](./LICENSE)
+
+[npm]: https://img.shields.io/npm/v/file-loader.svg
+[npm-url]: https://npmjs.com/package/file-loader
+[node]: https://img.shields.io/node/v/file-loader.svg
+[node-url]: https://nodejs.org
+[deps]: https://david-dm.org/webpack-contrib/file-loader.svg
+[deps-url]: https://david-dm.org/webpack-contrib/file-loader
+[tests]: https://github.com/webpack-contrib/file-loader/workflows/file-loader/badge.svg
+[tests-url]: https://github.com/webpack-contrib/file-loader/actions
+[cover]: https://codecov.io/gh/webpack-contrib/file-loader/branch/master/graph/badge.svg
+[cover-url]: https://codecov.io/gh/webpack-contrib/file-loader
+[chat]: https://img.shields.io/badge/gitter-webpack%2Fwebpack-brightgreen.svg
+[chat-url]: https://gitter.im/webpack/webpack
+[size]: https://packagephobia.now.sh/badge?p=file-loader
+[size-url]: https://packagephobia.now.sh/result?p=file-loader
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        # Changelog
+
+All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
+
+## [6.2.0](https://github.com/webpack-contrib/file-loader/compare/v6.1.1...v6.2.0) (2020-10-27)
+
+
+### Features
+
+* added the `sourceFilename` property to asset info with original filename ([#393](https://github.com/webpack-contrib/file-loader/issues/393)) ([654e0d6](https://github.com/webpack-contrib/file-loader/commit/654e0d641ec067089f6a2d12e30ec3520f00d808))
+
+
+### Bug Fixes
+
+* immutable flag when the `name` option have hash in query string ([#392](https://github.com/webpack-contrib/file-loader/issues/392)) ([381d8bd](https://github.com/webpack-contrib/file-loader/commit/381d8bda3f2494487bfe840386e365b97b6025fe))
+
+### [6.1.1](https://github.com/webpack-contrib/file-loader/compare/v6.1.0...v6.1.1) (2020-10-09)
+
+### Chore
+
+* update `schema-utils`
+
+## [6.1.0](https://github.com/webpack-contrib/file-loader/compare/v6.0.0...v6.1.0) (2020-08-31)
+
+
+### Features
+
+* pass immutable flag to asset info ([#383](https://github.com/webpack-contrib/file-loader/issues/383)) ([40fcde8](https://github.com/webpack-contrib/file-loader/commit/40fcde81681d4f8ee19d2ee3845fd34e24459195))
+
+## [6.0.0](https://github.com/webpack-contrib/file-loader/compare/v5.1.0...v6.0.0) (2020-03-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* use `md4` by default for hashing ([#369](https://github.com/webpack-contrib/file-loader/issues/369)) ([ad39022](https://github.com/webpack-contrib/file-loader/commit/ad3902284d28adeddf667212a39faa4c6bfb2964))
+
+## [5.1.0](https://github.com/webpack-contrib/file-loader/compare/v5.0.2...v5.1.0) (2020-02-19)
+
+
+### Features
+
+* support the `query` template for the `name` option ([#366](https://github.com/webpack-contrib/file-loader/issues/366)) ([cd8698b](https://github.com/webpack-contrib/file-loader/commit/cd8698b1d9fd560d85e912acca9a1e24f00e18f8))
+
+### [5.0.2](https://github.com/webpack-contrib/file-loader/compare/v5.0.1...v5.0.2) (2019-11-25)
+
+
+### Chore
+
+*  add the `funding` field in `package.json`
+
+
+
+### [5.0.1](https://github.com/webpack-contrib/file-loader/compare/v5.0.0...v5.0.1) (2019-11-25)
+
+
+### Bug Fixes
+
+* name of `esModule` option in source code ([#346](https://github.com/webpack-contrib/file-loader/issues/346)) ([31d6589](https://github.com/webpack-contrib/file-loader/commit/31d6589b71b471f83908e80380dff9b9eada2d06))
+
+## [5.0.0](https://github.com/webpack-contrib/file-loader/compare/v4.2.0...v5.0.0) (2019-11-22)
+
+
+### BREAKING CHANGES
+
+* minimum required nodejs version is `10.13.0`
+* rename the `esModules` option to `esModule`
+* switch to ES modules by default (the option `esModule` is `true` by default)
+
+
+
+## [4.3.0](https://github.com/webpack-contrib/file-loader/compare/v4.2.0...v4.3.0) (2019-11-21)
+
+
+### Features
+
+* new `esModules` option to output ES modules ([#340](https://github.com/webpack-contrib/file-loader/issues/340)) ([9b9cd8d](https://github.com/webpack-contrib/file-loader/commit/9b9cd8d22b3dbe4677be9bdd0bf5fbe07815df54))
+
+## [4.2.0](https://github.com/webpack-contrib/file-loader/compare/v4.1.0...v4.2.0) (2019-08-07)
+
+
+### Features
+
+* `postTransformPublicPath` option ([#334](https://github.com/webpack-contrib/file-loader/issues/334)) ([c136f44](https://github.com/webpack-contrib/file-loader/commit/c136f44))
+
+
+
+## [4.1.0](https://github.com/webpack-contrib/file-loader/compare/v4.0.0...v4.1.0) (2019-07-18)
+
+
+### Features
+
+* improved validation error messages ([#339](https://github.com/webpack-contrib/file-loader/issues/339)) ([705eed4](https://github.com/webpack-contrib/file-loader/commit/705eed4))
+
+
+
+## [4.0.0](https://github.com/webpack-contrib/file-loader/compare/v3.0.1...v4.0.0) (2019-06-05)
+
+
+### chore
+
+* **deps:** update ([#333](https://github.com/webpack-contrib/file-loader/issues/333)) ([0d2f9b8](https://github.com/webpack-contrib/file-loader/commit/0d2f9b8))
+
+
+### BREAKING CHANGES
+
+* **deps:** minimum required nodejs version is `8.9.0`
+
+
+
+<a name="3.0.1"></a>
+## [3.0.1](https://github.com/webpack-contrib/file-loader/compare/v3.0.0...v3.0.1) (2018-12-20)
+
+
+### Bug Fixes
+
+* relax options validation for additional properties ([#309](https://github.com/webpack-contrib/file-loader/issues/309)) ([c74d44e](https://github.com/webpack-contrib/file-loader/commit/c74d44e))
+
+
+
+<a name="3.0.0"></a>
+# [3.0.0](https://github.com/webpack-contrib/file-loader/compare/v2.0.0...v3.0.0) (2018-12-20)
+
+
+### Code Refactoring
+
+* drop support for webpack < 4 ([#303](https://github.com/webpack-contrib/file-loader/issues/303)) ([203a4ee](https://github.com/webpack-contrib/file-loader/commit/203a4ee))
+* more validations in `options` schema
+
+
+### Features
+
+* `resourcePath` is now available in `outputPath` and `publicPath` ([#304](https://github.com/webpack-contrib/file-loader/issues/304)) ([0d66e64](https://github.com/webpack-contrib/file-loader/commit/0d66e64))
+* `context` is now available in `outputPath` and `publicPath` ([#305](https://github.com/webpack-contrib/file-loader/issues/305)) ([d5eb823](https://github.com/webpack-contrib/file-loader/commit/d5eb823))
+
+
+### BREAKING CHANGES
+
+* removed the `useRelativePath` option. It is dangerously and break url when you use multiple entry points.
+* drop support for webpack < 4
+
+
+
+<a name="2.0.0"></a>
+# [2.0.0](https://github.com/webpack-contrib/file-loader/compare/v1.1.11...v2.0.0) (2018-08-21)
+
+
+### Code Refactoring
+
+* **defaults:** update to latest webpack-defaults ([#268](https://github.com/webpack-contrib/file-loader/issues/268)) ([687f422](https://github.com/webpack-contrib/file-loader/commit/687f422))
+
+
+### BREAKING CHANGES
+
+* **defaults:** Enforces `engines` of `"node": ">=6.9.0 < 7.0.0 || >= 8.9.0"`
+
+
+
+<a name="1.1.11"></a>
+## [1.1.11](https://github.com/webpack/file-loader/compare/v1.1.10...v1.1.11) (2018-03-01)
+
+
+### Reverts
+
+* **index:** `context` takes precedence over `issuer.context` (`options.useRelativePath`) ([#260](https://github.com/webpack/file-loader/issues/260)) ([e73131f](https://github.com/webpack/file-loader/commit/e73131f))
+
+
+
+<a name="1.1.10"></a>
+## [1.1.10](https://github.com/webpack/file-loader/compare/v1.1.9...v1.1.10) (2018-02-26)
+
+
+### Bug Fixes
+
+* **package:** add `webpack >= 4` (`peerDependencies`) ([#255](https://github.com/webpack/file-loader/issues/255)) ([3a6a7a1](https://github.com/webpack/file-loader/commit/3a6a7a1))
+
+
+
+<a name="1.1.9"></a>
+## [1.1.9](https://github.com/webpack/file-loader/compare/v1.1.8...v1.1.9) (2018-02-21)
+
+
+### Bug Fixes
+
+* **index:** handle protocol URL's correctly (`options.publicPath`) ([#253](https://github.com/webpack/file-loader/issues/253)) ([54fa5a3](https://github.com/webpack/file-loader/commit/54fa5a3))
+* **index:** use `path.posix` for platform consistency ([#254](https://github.com/webpack/file-loader/issues/254)) ([2afe0af](https://github.com/webpack/file-loader/commit/2afe0af))
+
+
+
+<a name="1.1.8"></a>
+## [1.1.8](https://github.com/webpack/file-loader/compare/v1.1.7...v1.1.8) (2018-02-20)
+
+
+### Bug Fixes
+
+* **index:** `context` takes

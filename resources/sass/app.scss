@@ -6,3 +6,88 @@
 
 // Bootstrap
 @import '~bootstrap/dist/css/bootstrap.rtl.min.css';
+
+// farsi fonts
+@font-face {
+    font-family: 'yekan';
+    src: url("../fonts/eot/Yekan.eot") format('opentype');
+    src: url("../fonts/ttf/Yekan.ttf") format("truetype"),
+    url("../fonts/woff/Yekan.woff") format('woff');
+}
+
+@font-face {
+    font-family: 'Yekan-regular';
+    src: url('../fonts/eot/yekan-regular.eot') format('opentype');
+    src: url("../fonts/ttf/yekan-regular.ttf") format("truetype"),
+    url("../fonts/woff/yekan-regular.woff") format('woff');
+}
+
+@font-face {
+    font-family: 'BYekan';
+    src: url('../fonts/eot/BYekan.eot') format('opentype');
+    src: url('../fonts/ttf/BYekan.ttf') format('truetype');
+    src: url('../fonts/woff/BYekan.woff') format('woff');
+    font-size: larger;
+}
+
+@font-face {
+    font-family: 'iransansdn';
+    src: url("../fonts/eot/iransansdn.eot") format('opentype');
+    src: url("../fonts/ttf/iransansdn.ttf") format('truetype');
+    src: url("../fonts/woff/iransansdn.woff") format('woff');
+}
+
+@font-face {
+    font-family: 'vazir-meduim', sans-serif;
+    src: url("../fonts/eot/Vazir-Medium.eot") format('opentype');
+    src: url("../fonts/ttf/Vazir-Medium.ttf") format('truetype');
+    src: url("../fonts/woff/Vazir-Medium.woff") format('woff');
+    src: url("../fonts/woff2/Vazir-Medium.woff2") format('woff2');
+}
+
+@font-face {
+    font-family: 'iransansbold';
+    src: url("../fonts/eot/iransansdnbold.eot") format('opentype');
+    src: url("../fonts/ttf/iransansdnbold.ttf") format('truetype');
+    src: url("../fonts/woff/iransansdnbold.woff") format('woff');
+}
+
+@font-face {
+    font-family: 'iransanslight';
+    src: url("../fonts/eot/iransansdnlight.eot") format('opentype');
+    src: url("../fonts/ttf/iransansdnlight.ttf") format('truetype');
+    src: url("../fonts/woff/iransansdnlight.woff") format('woff');
+}
+
+@font-face {
+    font-family: 'RobotoMono-Medium';
+    src: url("../fonts/ttf/RobotoMono-Medium.ttf") format('truetype');
+}
+
+@font-face {
+    font-family: 'iransans_num';
+    src: url("../fonts/number/IRANSansDN_Fa_Num.ttf") format('truetype');
+}
+
+@font-face {
+    font-family: 'iransans_num_bold';
+    src: url("../fonts/number/IRANSansDN_FaNum-Bold.ttf") format('truetype');
+}
+
+@font-face {
+    font-family: 'iransans_num_light';
+    src: url("../fonts/number/IRANSansDN_FaNum_Light.ttf") format('truetype');
+}
+
+// custom styles
+html {
+    height: 100%;
+}
+
+body {
+    display: flex;
+    height: 100%;
+    flex-direction: column;
+    font-family: 'iransansdn', sans-serif;
+
+}

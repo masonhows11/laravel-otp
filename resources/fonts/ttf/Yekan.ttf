@@ -1,0 +1,2175 @@
+
+                    'Export/file_template_server',
+                    $filename_template
+                );
+            }
+        } elseif ($export_type === 'database') {
+            if (! empty($remember_template)) {
+                $GLOBALS['PMA_Config']->setUserValue(
+                    'pma_db_filename_template',
+                    'Export/file_template_database',
+                    $filename_template
+                );
+            }
+        } elseif ($export_type === 'raw') {
+            if (! empty($remember_template)) {
+                $GLOBALS['PMA_Config']->setUserValue(
+                    'pma_raw_filename_template',
+                    'Export/file_template_raw',
+                    $filename_template
+                );
+            }
+        } else {
+            if (! empty($remember_template)) {
+                $GLOBALS['PMA_Config']->setUserValue(
+                    'pma_table_filename_template',
+                    'Export/file_template_table',
+                    $filename_template
+                );
+            }
+        }
+        $filename = Util::expandUserString($filename_template);
+        // remove dots in filename (coming from either the template or already
+        // part of the filename) to avoid a remote code execution vulnerability
+        $filename = Sanitize::sanitizeFilename($filename, true);
+
+        return $this->getFinalFilenameAndMimetypeForFilename(
+            $export_plugin,
+            $compression,
+            $filename
+        );
+    }
+
+    /**
+     * Open the export file
+     *
+     * @param string $filename     the export filename
+     * @param bool   $quick_export whether it's a quick export or not
+     *
+     * @return array the full save filename, possible message and the file handle
+     */
+    public function openFile(string $filename, bool $quick_export): array
+    {
+        $file_handle = null;
+        $message = '';
+        $doNotSaveItOver = true;
+
+        if (isset($_POST['quick_export_onserver_overwrite'])) {
+            $doNotSaveItOver = $_POST['quick_export_onserver_overwrite'] !== 'saveitover';
+        }
+
+        $save_filename = Util::userDir($GLOBALS['cfg']['SaveDir'])
+            . preg_replace('@[/\\\\]@', '_', $filename);
+
+        if (@file_exists($save_filename)
+            && ((! $quick_export && empty($_POST['onserver_overwrite']))
+            || ($quick_export
+            && $doNotSaveItOver))
+        ) {
+            $message = Message::error(
+                __(
+                    'File %s already exists on server, '
+                    . 'change filename or check overwrite option.'
+                )
+            );
+            $message->addParam($save_filename);
+        } elseif (@is_file($save_filename) && ! @is_writable($save_filename)) {
+            $message = Message::error(
+                __(
+                    'The web server does not have permission '
+                    . 'to save the file %s.'
+                )
+            );
+            $message->addParam($save_filename);
+        } else {
+            $file_handle = @fopen($save_filename, 'w');
+
+            if ($file_handle === false) {
+                $message = Message::error(
+                    __(
+                        'The web server does not have permission '
+                        . 'to save the file %s.'
+                    )
+                );
+                $message->addParam($save_filename);
+            }
+        }
+
+        return [
+            $save_filename,
+            $message,
+            $file_handle,
+        ];
+    }
+
+    /**
+     * Close the export file
+     *
+     * @param resource $file_handle   the export file handle
+     * @param string   $dump_buffer   the current dump buffer
+     * @param string   $save_filename the export filename
+     *
+     * @return Message a message object (or empty string)
+     */
+    public function closeFile(
+        $file_handle,
+        string $dump_buffer,
+        string $save_filename
+    ): Message {
+        $write_result = @fwrite($file_handle, $dump_buffer);
+        fclose($file_handle);
+        // Here, use strlen rather than mb_strlen to get the length
+        // in bytes to compare against the number of bytes written.
+        if (strlen($dump_buffer) > 0
+            && (! $write_result || $write_result != strlen($dump_buffer))
+        ) {
+            $message = new Message(
+                __('Insufficient space to save the file %s.'),
+                Message::ERROR,
+                [$save_filename]
+            );
+        } else {
+            $message = new Message(
+                __('Dump has been saved to file %s.'),
+                Message::SUCCESS,
+                [$save_filename]
+            );
+        }
+
+        return $message;
+    }
+
+    /**
+     * Compress the export buffer
+     *
+     * @param array|string $dump_buffer the current dump buffer
+     * @param string       $compression the compression mode
+     * @param string       $filename    the filename
+     *
+     * @return array|string|bool
+     */
+    public function compress($dump_buffer, string $compression, string $filename)
+    {
+        if ($compression === 'zip' && function_exists('gzcompress')) {
+            $zipExtension = new ZipExtension();
+            $filename = substr($filename, 0, -4); // remove extension (.zip)
+            $dump_buffer = $zipExtension->createFile($dump_buffer, $filename);
+        } elseif ($compression === 'gzip' && $this->gzencodeNeeded() && is_string($dump_buffer)) {
+            // without the optional parameter level because it bugs
+            $dump_buffer = gzencode($dump_buffer);
+        }
+
+        return $dump_buffer;
+    }
+
+    /**
+     * Saves the dump_buffer for a particular table in an array
+     * Used in separate files export
+     *
+     * @param string $object_name the name of current object to be stored
+     * @param bool   $append      optional boolean to append to an existing index or not
+     */
+    public function saveObjectInBuffer(string $object_name, bool $append = false): void
+    {
+        global $dump_buffer_objects, $dump_buffer, $dump_buffer_len;
+
+        if (! empty($dump_buffer)) {
+            if ($append && isset($dump_buffer_objects[$object_name])) {
+                $dump_buffer_objects[$object_name] .= $dump_buffer;
+            } else {
+                $dump_buffer_objects[$object_name] = $dump_buffer;
+            }
+        }
+
+        // Re - initialize
+        $dump_buffer = '';
+        $dump_buffer_len = 0;
+    }
+
+    /**
+     * Returns HTML containing the header for a displayed export
+     *
+     * @param string $export_type the export type
+     * @param string $db          the database name
+     * @param string $table       the table name
+     *
+     * @return string[] the generated HTML and back button
+     */
+    public function getHtmlForDisplayedExportHeader(
+        string $export_type,
+        string $db,
+        string $table
+    ): array {
+        $html = '<div>';
+
+        /**
+         * Displays a back button with all the $_POST data in the URL
+         * (store in a variable to also display after the textarea)
+         */
+        $back_button = '<p id="export_back_button">[ <a href="';
+        if ($export_type === 'server') {
+            $back_button .= Url::getFromRoute('/server/export') . '" data-post="' . Url::getCommon([], '');
+        } elseif ($export_type === 'database') {
+            $back_button .= Url::getFromRoute('/database/export') . '" data-post="' . Url::getCommon(['db' => $db], '');
+        } else {
+            $back_button .= Url::getFromRoute('/table/export') . '" data-post="' . Url::getCommon(
+                [
+                    'db' => $db,
+                    'table' => $table,
+                ],
+                ''
+            );
+        }
+
+        // Convert the multiple select elements from an array to a string
+        if ($export_type === 'database') {
+            $structOrDataForced = empty($_POST['structure_or_data_forced']);
+            if ($structOrDataForced && ! isset($_POST['table_structure'])) {
+                $_POST['table_structure'] = [];
+            }
+            if ($structOrDataForced && ! isset($_POST['table_data'])) {
+                $_POST['table_data'] = [];
+            }
+        }
+
+        foreach ($_POST as $name => $value) {
+            if (is_array($value)) {
+                continue;
+            }
+
+            $back_button .= '&amp;' . urlencode((string) $name) . '=' . urlencode((string) $value);
+        }
+        $back_button .= '&amp;repopulate=1">' . __('Back') . '</a> ]</p>';
+        $html .= '<br>';
+        $html .= $back_button;
+        $refreshButton = '<form id="export_refresh_form" method="POST" action="'
+            . Url::getFromRoute('/export') . '" class="disableAjax">';
+        $refreshButton .= '[ <a class="disableAjax export_refresh_btn">' . __('Refresh') . '</a> ]';
+        foreach ($_POST as $name => $value) {
+            if (is_array($value)) {
+                foreach ($value as $val) {
+                    $refreshButton .= '<input type="hidden" name="' . htmlentities((string) $name)
+                        . '[]" value="' . htmlentities((string) $val) . '">';
+                }
+            } else {
+                $refreshButton .= '<input type="hidden" name="' . htmlentities((string) $name)
+                    . '" value="' . htmlentities((string) $value) . '">';
+            }
+        }
+        $refreshButton .= '</form>';
+        $html .= $refreshButton
+            . '<br>'
+            . '<form name="nofunction">'
+            . '<textarea name="sqldump" cols="50" rows="30" '
+            . 'id="textSQLDUMP" wrap="OFF">';
+
+        return [
+            $html,
+            $back_button,
+            $refreshButton,
+        ];
+    }
+
+    /**
+     * Export at the server level
+     *
+     * @param string|array $db_select       the selected databases to export
+     * @param string       $whatStrucOrData structure or data or both
+     * @param ExportPlugin $export_plugin   the selected export plugin
+     * @param string       $crlf            end of line character(s)
+     * @param string       $err_url         the URL in case of error
+     * @param string       $export_type     the export type
+     * @param bool         $do_relation     whether to export relation info
+     * @param bool         $do_comments     whether to add comments
+     * @param bool         $do_mime         whether to add MIME info
+     * @param bool         $do_dates        whether to add dates
+     * @param array        $aliases         alias information for db/table/column
+     * @param string       $separate_files  whether it is a separate-files export
+     */
+    public function exportServer(
+        $db_select,
+        string $whatStrucOrData,
+        ExportPlugin $export_plugin,
+        string $crlf,
+        string $err_url,
+        string $export_type,
+        bool $do_relation,
+        bool $do_comments,
+        bool $do_mime,
+        bool $do_dates,
+        array $aliases,
+        string $separate_files
+    ): void {
+        if (! empty($db_select)) {
+            $tmp_select = implode('|', $db_select);
+            $tmp_select = '|' . $tmp_select . '|';
+        }
+        // Walk over databases
+        foreach ($GLOBALS['dblist']->databases as $current_db) {
+            if (! isset($tmp_select)
+                || ! mb_strpos(' ' . $tmp_select, '|' . $current_db . '|')
+            ) {
+                continue;
+            }
+
+            $tables = $this->dbi->getTables($current_db);
+            $this->exportDatabase(
+                $current_db,
+                $tables,
+                $whatStrucOrData,
+                $tables,
+                $tables,
+                $export_plugin,
+                $crlf,
+                $err_url,
+                $export_type,
+                $do_relation,
+                $do_comments,
+                $do_mime,
+                $do_dates,
+                $aliases,
+                $separate_files === 'database' ? $separate_files : ''
+            );
+            if ($separate_files !== 'server') {
+                continue;
+            }
+
+            $this->saveObjectInBuffer($current_db);
+        }
+    }
+
+    /**
+     * Export at the database level
+     *
+     * @param string       $db              the database to export
+     * @param array        $tables          the tables to export
+     * @param string       $whatStrucOrData structure or data or both
+     * @param array        $table_structure whether to export structure for each table
+     * @param array        $table_data      whether to export data for each table
+     * @param ExportPlugin $export_plugin   the selected export plugin
+     * @param string       $crlf            end of line character(s)
+     * @param string       $err_url         the URL in case of error
+     * @param string       $export_type     the export type
+     * @param bool         $do_relation     whether to export relation info
+     * @param bool         $do_comments     whether to add comments
+     * @param bool         $do_mime         whether to add MIME info
+     * @param bool         $do_dates        whether to add dates
+     * @param array        $aliases         Alias information for db/table/column
+     * @param string       $separate_files  whether it is a separate-files export
+     */
+    public function exportDatabase(
+        string $db,
+        array $tables,
+        string $whatStrucOrData,
+        array $table_structure,
+        array $table_data,
+        ExportPlugin $export_plugin,
+        string $crlf,
+        string $err_url,
+        string $export_type,
+        bool $do_relation,
+        bool $do_comments,
+        bool $do_mime,
+        bool $do_dates,
+        array $aliases,
+        string $separate_files
+    ): void {
+        $db_alias = ! empty($aliases[$db]['alias'])
+            ? $aliases[$db]['alias'] : '';
+
+        if (! $export_plugin->exportDBHeader($db, $db_alias)) {
+            return;
+        }
+        if (! $export_plugin->exportDBCreate($db, $export_type, $db_alias)) {
+            return;
+        }
+        if ($separate_files === 'database') {
+            $this->saveObjectInBuffer('database', true);
+        }
+
+        if (($GLOBALS['sql_structure_or_data'] === 'structure'
+            || $GLOBALS['sql_structure_or_data'] === 'structure_and_data')
+            && isset($GLOBALS['sql_procedure_function'])
+        ) {
+            $export_plugin->exportRoutines($db, $aliases);
+
+            if ($separate_files === 'database') {
+                $this->saveObjectInBuffer('routines');
+            }
+        }
+
+        $views = [];
+
+        foreach ($tables as $table) {
+            $_table = new Table($table, $db);
+            // if this is a view, collect it for later;
+            // views must be exported after the tables
+            $is_view = $_table->isView();
+            if ($is_view) {
+                $views[] = $table;
+            }
+            if (($whatStrucOrData === 'structure'
+                || $whatStrucOrData === 'structure_and_data')
+                && in_array($table, $table_structure)
+            ) {
+                // for a view, export a stand-in definition of the table
+                // to resolve view dependencies (only when it's a single-file export)
+                if ($is_view) {
+                    if ($separate_files == ''
+                        && isset($GLOBALS['sql_create_view'])
+                        && ! $export_plugin->exportStructure(
+                            $db,
+                            $table,
+                            $crlf,
+                            $err_url,
+                            'stand_in',
+                            $export_type,
+                            $do_relation,
+                            $do_comments,
+                            $do_mime,
+                            $do_dates,
+                            $aliases
+                        )
+                    ) {
+                        break;
+                    }
+                } elseif (isset($GLOBALS['sql_create_table'])) {
+                    $table_size = $GLOBALS['maxsize'];
+                    // Checking if the maximum table size constrain has been set
+                    // And if that constrain is a valid number or not
+                    if ($table_size !== '' && is_numeric($table_size)) {
+                        // This obtains the current table's size
+                        $query = 'SELECT data_length + index_length
+                              from information_schema.TABLES
+                              WHERE table_schema = "' . $this->dbi->escapeString($db) . '"
+                              AND table_name = "' . $this->dbi->escapeString($table) . '"';
+
+                        $size = $this->dbi->fetchValue($query);
+                        //Converting the size to MB
+                        $size /= 1024 / 1024;
+                        if ($size > $table_size) {
+                            continue;
+                        }
+                    }
+
+                    if (! $export_plugin->exportStructure(
+                        $db,
+                        $table,
+                        $crlf,
+                        $err_url,
+                        'create_table',
+                        $export_type,
+                        $do_relation,
+                        $do_comments,
+                        $do_mime,
+                        $do_dates,
+                        $aliases
+                    )) {
+                        break;
+                    }
+                }
+            }
+            // if this is a view or a merge table, don't export data
+            if (($whatStrucOrData === 'data' || $whatStrucOrData === 'structure_and_data')
+                && in_array($table, $table_data)
+                && ! $is_view
+            ) {
+                $tableObj = new Table($table, $db);
+                $nonGeneratedCols = $tableObj->getNonGeneratedColumns(true);
+
+                $local_query  = 'SELECT ' . implode(', ', $nonGeneratedCols)
+                    . ' FROM ' . Util::backquote($db)
+                    . '.' . Util::backquote($table);
+
+                if (! $export_plugin->exportData(
+                    $db,
+                    $table,
+                    $crlf,
+                    $err_url,
+                    $local_query,
+                    $aliases
+                )) {
+                    break;
+                }
+            }
+
+            // this buffer was filled, we save it and go to the next one
+            if ($separate_files === 'database') {
+                $this->saveObjectInBuffer('table_' . $table);
+            }
+
+            // now export the triggers (needs to be done after the data because
+            // triggers can modify already imported tables)
+            if (! isset($GLOBALS['sql_create_trigger']) || ($whatStrucOrData !== 'structure'
+                && $whatStrucOrData !== 'structure_and_data')
+                || ! in_array($table, $table_structure)
+            ) {
+                continue;
+            }
+
+            if (! $export_plugin->exportStructure(
+                $db,
+                $table,
+                $crlf,
+                $err_url,
+                'triggers',
+                $export_type,
+                $do_relation,
+                $do_comments,
+                $do_mime,
+                $do_dates,
+                $aliases
+            )) {
+                break;
+            }
+
+            if ($separate_files !== 'database') {
+                continue;
+            }
+
+            $this->saveObjectInBuffer('table_' . $table, true);
+        }
+
+        if (isset($GLOBALS['sql_create_view'])) {
+            foreach ($views as $view) {
+                // no data export for a view
+                if ($whatStrucOrData !== 'structure'
+                    && $whatStrucOrData !== 'structure_and_data'
+                ) {
+                    continue;
+                }
+
+                if (! $export_plugin->exportStructure(
+                    $db,
+                    $view,
+                    $crlf,
+                    $err_url,
+                    'create_view',
+                    $export_type,
+                    $do_relation,
+                    $do_comments,
+                    $do_mime,
+                    $do_dates,
+                    $aliases
+                )) {
+                    break;
+                }
+
+                if ($separate_files !== 'database') {
+                    continue;
+                }
+
+                $this->saveObjectInBuffer('view_' . $view);
+            }
+        }
+
+        if (! $export_plugin->exportDBFooter($db)) {
+            return;
+        }
+
+        // export metadata related to this db
+        if (isset($GLOBALS['sql_metadata'])) {
+            // Types of metadata to export.
+            // In the future these can be allowed to be selected by the user
+            $metadataTypes = $this->getMetadataTypes();
+            $export_plugin->exportMetadata($db, $tables, $metadataTypes);
+
+            if ($separate_files === 'database') {
+                $this->saveObjectInBuffer('metadata');
+            }
+        }
+
+        if ($separate_files === 'database') {
+            $this->saveObjectInBuffer('extra');
+        }
+
+        if (($GLOBALS['sql_structure_or_data'] !== 'structure'
+            && $GLOBALS['sql_structure_or_data'] !== 'structure_and_data')
+            || ! isset($GLOBALS['sql_procedure_function'])
+        ) {
+            return;
+        }
+
+        $export_plugin->exportEvents($db);
+
+        if ($separate_files !== 'database') {
+            return;
+        }
+
+        $this->saveObjectInBuffer('events');
+    }
+
+    /**
+     * Export a raw query
+     *
+     * @param string       $whatStrucOrData whether to export structure for each table or raw
+     * @param ExportPlugin $export_plugin   the selected export plugin
+     * @param string       $crlf            end of line character(s)
+     * @param string       $err_url         the URL in case of error
+     * @param string       $sql_query       the query to be executed
+     * @param string       $export_type     the export type
+     */
+    public static function exportRaw(
+        string $whatStrucOrData,
+        ExportPlugin $export_plugin,
+        string $crlf,
+        string $err_url,
+        string $sql_query,
+        string $export_type
+    ): void {
+        // In case the we need to dump just the raw query
+        if ($whatStrucOrData !== 'raw') {
+            return;
+        }
+
+        if (! $export_plugin->exportRawQuery(
+            $err_url,
+            $sql_query,
+            $crlf
+        )) {
+            $GLOBALS['message'] = Message::error(
+                // phpcs:disable Generic.Files.LineLength.TooLong
+                /* l10n: A query written by the user is a "raw query" that could be using no tables or databases in particular */
+                __('Exporting a raw query is not supported for this export method.')
+            );
+
+            return;
+        }
+    }
+
+    /**
+     * Export at the table level
+     *
+     * @param string       $db              the database to export
+     * @param string       $table           the table to export
+     * @param string       $whatStrucOrData structure or data or both
+     * @param ExportPlugin $export_plugin   the selected export plugin
+     * @param string       $crlf            end of line character(s)
+     * @param string       $err_url         the URL in case of error
+     * @param string       $export_type     the export type
+     * @param bool         $do_relation     whether to export relation info
+     * @param bool         $do_comments     whether to add comments
+     * @param bool         $do_mime         whether to add MIME info
+     * @param bool         $do_dates        whether to add dates
+     * @param string|null  $allrows         whether "dump all rows" was ticked
+     * @param string       $limit_to        upper limit
+     * @param string       $limit_from      starting limit
+     * @param string       $sql_query       query for which exporting is requested
+     * @param array        $aliases         Alias information for db/table/column
+     */
+    public function exportTable(
+        string $db,
+        string $table,
+        string $whatStrucOrData,
+        ExportPlugin $export_plugin,
+        string $crlf,
+        string $err_url,
+        string $export_type,
+        bool $do_relation,
+        bool $do_comments,
+        bool $do_mime,
+        bool $do_dates,
+        ?string $allrows,
+        string $limit_to,
+        string $limit_from,
+        string $sql_query,
+        array $aliases
+    ): void {
+        $db_alias = ! empty($aliases[$db]['alias'])
+            ? $aliases[$db]['alias'] : '';
+        if (! $export_plugin->exportDBHeader($db, $db_alias)) {
+            return;
+        }
+        if (isset($allrows)
+            && $allrows == '0'
+            && $limit_to > 0
+            && $limit_from >= 0
+        ) {
+            $add_query  = ' LIMIT '
+                        . ($limit_from > 0 ? $limit_from . ', ' : '')
+                        . $limit_to;
+        } else {
+            $add_query  = '';
+        }
+
+        $_table = new Table($table, $db);
+        $is_view = $_table->isView();
+        if ($whatStrucOrData === 'structure'
+            || $whatStrucOrData === 'structure_and_data'
+        ) {
+            if ($is_view) {
+                if (isset($GLOBALS['sql_create_view'])) {
+                    if (! $export_plugin->exportStructure(
+                        $db,
+                        $table,
+                        $crlf,
+                        $err_url,
+                        'create_view',
+                        $export_type,
+                        $do_relation,
+                        $do_comments,
+                        $do_mime,
+                        $do_dates,
+                        $aliases
+                    )) {
+                        return;
+                    }
+                }
+            } elseif (isset($GLOBALS['sql_create_table'])) {
+                if (! $export_plugin->exportStructure(
+                    $db,
+                    $table,
+                    $crlf,
+                    $err_url,
+                    'create_table',
+                    $export_type,
+                    $do_relation,
+                    $do_comments,
+                    $do_mime,
+                    $do_dates,
+                    $aliases
+                )) {
+                    return;
+                }
+            }
+        }
+        // If this is an export of a single view, we have to export data;
+        // for example, a PDF report
+        // if it is a merge table, no data is exported
+        if ($whatStrucOrData === 'data'
+            || $whatStrucOrData === 'structure_and_data'
+        ) {
+            if (! empty($sql_query)) {
+                // only preg_replace if needed
+                if (! empty($add_query)) {
+                    // remove trailing semicolon before adding a LIMIT
+                    $sql_query = preg_replace('%;\s*$%', '', $sql_query);
+                }
+                $local_query = $sql_query . $add_query;
+                $this->dbi->selectDb($db);
+            } else {
+                // Data is exported only for Non-generated columns
+                $tableObj = new Table($table, $db);
+                $nonGeneratedCols = $tableObj->getNonGeneratedColumns(true);
+
+                $local_query  = 'SELECT ' . implode(', ', $nonGeneratedCols)
+                    . ' FROM ' . Util::backquote($db)
+                    . '.' . Util::backquote($table) . $add_query;
+            }
+            if (! $export_plugin->exportData(
+                $db,
+                $table,
+                $crlf,
+                $err_url,
+                $local_query,
+                $aliases
+            )) {
+                return;
+            }
+        }
+        // now export the triggers (needs to be done after the data because
+        // triggers can modify already imported tables)
+        if (isset($GLOBALS['sql_create_trigger']) && ($whatStrucOrData === 'structure'
+            || $whatStrucOrData === 'structure_and_data')
+        ) {
+            if (! $export_plugin->exportStructure(
+                $db,
+                $table,
+                $crlf,
+                $err_url,
+                'triggers',
+                $export_type,
+                $do_relation,
+                $do_comments,
+                $do_mime,
+                $do_dates,
+                $aliases
+            )) {
+                return;
+            }
+        }
+        if (! $export_plugin->exportDBFooter($db)) {
+            return;
+        }
+
+        if (! isset($GLOBALS['sql_metadata'])) {
+            return;
+        }
+
+        // Types of metadata to export.
+        // In the future these can be allowed to be selected by the user
+        $metadataTypes = $this->getMetadataTypes();
+        $export_plugin->exportMetadata($db, $table, $metadataTypes);
+    }
+
+    /**
+     * Loads correct page after doing export
+     */
+    public function showPage(string $exportType): void
+    {
+        global $active_page, $containerBuilder;
+
+        if ($exportType === 'server') {
+            $active_page = Url::getFromRoute('/server/export');
+            /** @var ServerExportController $controller */
+            $controller = $containerBuilder->get(ServerExportController::class);
+            $controller->index();
+
+            return;
+        }
+
+        if ($exportType === 'database') {
+            $active_page = Url::getFromRoute('/database/export');
+            /** @var DatabaseExportController $controller */
+            $controller = $containerBuilder->get(DatabaseExportController::class);
+            $controller->index();
+
+            return;
+        }
+
+        $active_page = Url::getFromRoute('/table/export');
+        /** @var TableExportController $controller */
+        $controller = $containerBuilder->get(TableExportController::class);
+        $controller->index();
+    }
+
+    /**
+     * Merge two alias arrays, if array1 and array2 have
+     * conflicting alias then array2 value is used if it
+     * is non empty otherwise array1 value.
+     *
+     * @param array $aliases1 first array of aliases
+     * @param array $aliases2 second array of aliases
+     *
+     * @return array resultant merged aliases info
+     */
+    public function mergeAliases(array $aliases1, array $aliases2): array
+    {
+        // First do a recursive array merge
+        // on aliases arrays.
+        $aliases = array_merge_recursive($aliases1, $aliases2);
+        // Now, resolve conflicts in aliases, if any
+        foreach ($aliases as $db_name => $db) {
+            // If alias key is an array then
+            // it is a merge conflict.
+            if (isset($db['alias']) && is_array($db['alias'])) {
+                $val1 = $db['alias'][0];
+                $val2 = $db['alias'][1];
+                // Use aliases2 alias if non empty
+                $aliases[$db_name]['alias']
+                    = empty($val2) ? $val1 : $val2;
+            }
+            if (! isset($db['tables'])) {
+                continue;
+            }
+            foreach ($db['tables'] as $tbl_name => $tbl) {
+                if (isset($tbl['alias']) && is_array($tbl['alias'])) {
+                    $val1 = $tbl['alias'][0];
+                    $val2 = $tbl['alias'][1];
+                    // Use aliases2 alias if non empty
+                    $aliases[$db_name]['tables'][$tbl_name]['alias']
+                        = empty($val2) ? $val1 : $val2;
+                }
+                if (! isset($tbl['columns'])) {
+                    continue;
+                }
+                foreach ($tbl['columns'] as $col => $col_as) {
+                    if (! isset($col_as) || ! is_array($col_as)) {
+                        continue;
+                    }
+
+                    $val1 = $col_as[0];
+                    $val2 = $col_as[1];
+                    // Use aliases2 alias if non empty
+                    $aliases[$db_name]['tables'][$tbl_name]['columns'][$col]
+                        = empty($val2) ? $val1 : $val2;
+                }
+            }
+        }
+
+        return $aliases;
+    }
+
+    /**
+     * Locks tables
+     *
+     * @param string $db       database name
+     * @param array  $tables   list of table names
+     * @param string $lockType lock type; "[LOW_PRIORITY] WRITE" or "READ [LOCAL]"
+     *
+     * @return mixed result of the query
+     */
+    public function lockTables(string $db, array $tables, string $lockType = 'WRITE')
+    {
+        $locks = [];
+        foreach ($tables as $table) {
+            $locks[] = Util::backquote($db) . '.'
+                . Util::backquote($table) . ' ' . $lockType;
+        }
+
+        $sql = 'LOCK TABLES ' . implode(', ', $locks);
+
+        return $this->dbi->tryQuery($sql);
+    }
+
+    /**
+     * Releases table locks
+     *
+     * @return mixed result of the query
+     */
+    public function unlockTables()
+    {
+        return $this->dbi->tryQuery('UNLOCK TABLES');
+    }
+
+    /**
+     * Returns all the metadata types that can be exported with a database or a table
+     *
+     * @return string[] metadata types.
+     */
+    public function getMetadataTypes(): array
+    {
+        return [
+            'column_info',
+            'table_uiprefs',
+            'tracking',
+            'bookmark',
+            'relation',
+            'table_coords',
+            'pdf_pages',
+            'savedsearches',
+            'central_columns',
+            'export_templates',
+        ];
+    }
+
+    /**
+     * Returns the checked clause, depending on the presence of key in array
+     *
+     * @param string $key   the key to look for
+     * @param array  $array array to verify
+     *
+     * @return string the checked clause
+     */
+    public function getCheckedClause(string $key, array $array): string
+    {
+        if (in_array($key, $array)) {
+            return ' checked="checked"';
+        }
+
+        return '';
+    }
+
+    /**
+     * get all the export options and verify
+     * call and include the appropriate Schema Class depending on $export_type
+     *
+     * @param string|null $export_type format of the export
+     */
+    public function processExportSchema(?string $export_type): void
+    {
+        /**
+         * default is PDF, otherwise validate it's only letters a-z
+         */
+        if (! isset($export_type) || ! preg_match('/^[a-zA-Z]+$/', $export_type)) {
+            $export_type = 'pdf';
+        }
+
+        // sanitize this parameter which will be used below in a file inclusion
+        $export_type = Core::securePath($export_type);
+
+        // get the specific plugin
+        /** @var SchemaPlugin $export_plugin */
+        $export_plugin = Plugins::getPlugin(
+            'schema',
+            $export_type,
+            'libraries/classes/Plugins/Schema/'
+        );
+
+        // Check schema export type
+        if ($export_plugin === null || ! is_object($export_plugin)) {
+            Core::fatalError(__('Bad type!'));
+        }
+
+        $this->dbi->selectDb($_POST['db']);
+        $export_plugin->exportSchema($_POST['db']);
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*! jQuery UI - v1.12.1 - 2016-12-21
+* http://jqueryui.com
+* Includes: draggable.css, core.css, resizable.css, selectable.css, sortable.css, accordion.css, autocomplete.css, menu.css, button.css, controlgroup.css, checkboxradio.css, datepicker.css, dialog.css, progressbar.css, selectmenu.css, slider.css, spinner.css, tabs.css, tooltip.css, theme.css
+* To view and modify this theme, visit http://jqueryui.com/themeroller/?scope=&folderName=smoothness&cornerRadiusShadow=8px&offsetLeftShadow=-8px&offsetTopShadow=-8px&thicknessShadow=8px&opacityShadow=30&bgImgOpacityShadow=0&bgTextureShadow=flat&bgColorShadow=aaaaaa&opacityOverlay=30&bgImgOpacityOverlay=0&bgTextureOverlay=flat&bgColorOverlay=aaaaaa&iconColorError=cd0a0a&fcError=cd0a0a&borderColorError=cd0a0a&bgImgOpacityError=95&bgTextureError=glass&bgColorError=fef1ec&iconColorHighlight=2e83ff&fcHighlight=363636&borderColorHighlight=fcefa1&bgImgOpacityHighlight=55&bgTextureHighlight=glass&bgColorHighlight=fbf9ee&iconColorActive=454545&fcActive=212121&borderColorActive=aaaaaa&bgImgOpacityActive=65&bgTextureActive=glass&bgColorActive=ffffff&iconColorHover=454545&fcHover=212121&borderColorHover=999999&bgImgOpacityHover=75&bgTextureHover=glass&bgColorHover=dadada&iconColorDefault=888888&fcDefault=555555&borderColorDefault=d3d3d3&bgImgOpacityDefault=75&bgTextureDefault=glass&bgColorDefault=e6e6e6&iconColorContent=222222&fcContent=222222&borderColorContent=aaaaaa&bgImgOpacityContent=75&bgTextureContent=flat&bgColorContent=ffffff&iconColorHeader=222222&fcHeader=222222&borderColorHeader=aaaaaa&bgImgOpacityHeader=75&bgTextureHeader=highlight_soft&bgColorHeader=cccccc&cornerRadius=4px&fsDefault=1.1em&fwDefault=normal&ffDefault=Verdana%2CArial%2Csans-serif
+* Copyright jQuery Foundation and other contributors; Licensed MIT */
+
+.ui-draggable-handle {
+	-ms-touch-action: none;
+	touch-action: none;
+}
+/* Layout helpers
+----------------------------------*/
+.ui-helper-hidden {
+	display: none;
+}
+.ui-helper-hidden-accessible {
+	border: 0;
+	clip: rect(0 0 0 0);
+	height: 1px;
+	margin: -1px;
+	overflow: hidden;
+	padding: 0;
+	position: absolute;
+	width: 1px;
+}
+.ui-helper-reset {
+	margin: 0;
+	padding: 0;
+	border: 0;
+	outline: 0;
+	line-height: 1.3;
+	text-decoration: none;
+	font-size: 100%;
+	list-style: none;
+}
+.ui-helper-clearfix:before,
+.ui-helper-clearfix:after {
+	content: "";
+	display: table;
+	border-collapse: collapse;
+}
+.ui-helper-clearfix:after {
+	clear: both;
+}
+.ui-helper-zfix {
+	width: 100%;
+	height: 100%;
+	top: 0;
+	left: 0;
+	position: absolute;
+	opacity: 0;
+	filter:Alpha(Opacity=0); /* support: IE8 */
+}
+
+.ui-front {
+	z-index: 100;
+}
+
+
+/* Interaction Cues
+----------------------------------*/
+.ui-state-disabled {
+	cursor: default !important;
+	pointer-events: none;
+}
+
+
+/* Icons
+----------------------------------*/
+.ui-icon {
+	display: inline-block;
+	vertical-align: middle;
+	margin-top: -.25em;
+	position: relative;
+	text-indent: -99999px;
+	overflow: hidden;
+	background-repeat: no-repeat;
+}
+
+.ui-widget-icon-block {
+	left: 50%;
+	margin-left: -8px;
+	display: block;
+}
+
+/* Misc visuals
+----------------------------------*/
+
+/* Overlays */
+.ui-widget-overlay {
+	position: fixed;
+	top: 0;
+	left: 0;
+	width: 100%;
+	height: 100%;
+}
+.ui-resizable {
+	position: relative;
+}
+.ui-resizable-handle {
+	position: absolute;
+	font-size: 0.1px;
+	display: block;
+	-ms-touch-action: none;
+	touch-action: none;
+}
+.ui-resizable-disabled .ui-resizable-handle,
+.ui-resizable-autohide .ui-resizable-handle {
+	display: none;
+}
+.ui-resizable-n {
+	cursor: n-resize;
+	height: 7px;
+	width: 100%;
+	top: -5px;
+	left: 0;
+}
+.ui-resizable-s {
+	cursor: s-resize;
+	height: 7px;
+	width: 100%;
+	bottom: -5px;
+	left: 0;
+}
+.ui-resizable-e {
+	cursor: e-resize;
+	width: 7px;
+	right: -5px;
+	top: 0;
+	height: 100%;
+}
+.ui-resizable-w {
+	cursor: w-resize;
+	width: 7px;
+	left: -5px;
+	top: 0;
+	height: 100%;
+}
+.ui-resizable-se {
+	cursor: se-resize;
+	width: 12px;
+	height: 12px;
+	right: 1px;
+	bottom: 1px;
+}
+.ui-resizable-sw {
+	cursor: sw-resize;
+	width: 9px;
+	height: 9px;
+	left: -5px;
+	bottom: -5px;
+}
+.ui-resizable-nw {
+	cursor: nw-resize;
+	width: 9px;
+	height: 9px;
+	left: -5px;
+	top: -5px;
+}
+.ui-resizable-ne {
+	cursor: ne-resize;
+	width: 9px;
+	height: 9px;
+	right: -5px;
+	top: -5px;
+}
+.ui-selectable {
+	-ms-touch-action: none;
+	touch-action: none;
+}
+.ui-selectable-helper {
+	position: absolute;
+	z-index: 100;
+	border: 1px dotted black;
+}
+.ui-sortable-handle {
+	-ms-touch-action: none;
+	touch-action: none;
+}
+.ui-accordion .ui-accordion-header {
+	display: block;
+	cursor: pointer;
+	position: relative;
+	margin: 2px 0 0 0;
+	padding: .5em .5em .5em .7em;
+	font-size: 100%;
+}
+.ui-accordion .ui-accordion-content {
+	padding: 1em 2.2em;
+	border-top: 0;
+	overflow: auto;
+}
+.ui-autocomplete {
+	position: absolute;
+	top: 0;
+	left: 0;
+	cursor: default;
+}
+.ui-menu {
+	list-style: none;
+	padding: 0;
+	margin: 0;
+	display: block;
+	outline: 0;
+}
+.ui-menu .ui-menu {
+	position: absolute;
+}
+.ui-menu .ui-menu-item {
+	margin: 0;
+	cursor: pointer;
+	/* support: IE10, see #8844 */
+	list-style-image: url("data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
+}
+.ui-menu .ui-menu-item-wrapper {
+	position: relative;
+	padding: 3px 1em 3px .4em;
+}
+.ui-menu .ui-menu-divider {
+	margin: 5px 0;
+	height: 0;
+	font-size: 0;
+	line-height: 0;
+	border-width: 1px 0 0 0;
+}
+.ui-menu .ui-state-focus,
+.ui-menu .ui-state-active {
+	margin: -1px;
+}
+
+/* icon support */
+.ui-menu-icons {
+	position: relative;
+}
+.ui-menu-icons .ui-menu-item-wrapper {
+	padding-left: 2em;
+}
+
+/* left-aligned */
+.ui-menu .ui-icon {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: .2em;
+	margin: auto 0;
+}
+
+/* right-aligned */
+.ui-menu .ui-menu-icon {
+	left: auto;
+	right: 0;
+}
+.ui-button {
+	padding: .4em 1em;
+	display: inline-block;
+	position: relative;
+	line-height: normal;
+	margin-right: .1em;
+	cursor: pointer;
+	vertical-align: middle;
+	text-align: center;
+	-webkit-user-select: none;
+	-moz-user-select: none;
+	-ms-user-select: none;
+	user-select: none;
+
+	/* Support: IE <= 11 */
+	overflow: visible;
+}
+
+.ui-button,
+.ui-button:link,
+.ui-button:visited,
+.ui-button:hover,
+.ui-button:active {
+	text-decoration: none;
+}
+
+/* to make room for the icon, a width needs to be set here */
+.ui-button-icon-only {
+	width: 2em;
+	box-sizing: border-box;
+	text-indent: -9999px;
+	white-space: nowrap;
+}
+
+/* no icon support for input elements */
+input.ui-button.ui-button-icon-only {
+	text-indent: 0;
+}
+
+/* button icon element(s) */
+.ui-button-icon-only .ui-icon {
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	margin-top: -8px;
+	margin-left: -8px;
+}
+
+.ui-button.ui-icon-notext .ui-icon {
+	padding: 0;
+	width: 2.1em;
+	height: 2.1em;
+	text-indent: -9999px;
+	white-space: nowrap;
+
+}
+
+input.ui-button.ui-icon-notext .ui-icon {
+	width: auto;
+	height: auto;
+	text-indent: 0;
+	white-space: normal;
+	padding: .4em 1em;
+}
+
+/* workarounds */
+/* Support: Firefox 5 - 40 */
+input.ui-button::-moz-focus-inner,
+button.ui-button::-moz-focus-inner {
+	border: 0;
+	padding: 0;
+}
+.ui-controlgroup {
+	vertical-align: middle;
+	display: inline-block;
+}
+.ui-controlgroup > .ui-controlgroup-item {
+	float: left;
+	margin-left: 0;
+	margin-right: 0;
+}
+.ui-controlgroup > .ui-controlgroup-item:focus,
+.ui-controlgroup > .ui-controlgroup-item.ui-visual-focus {
+	z-index: 9999;
+}
+.ui-controlgroup-vertical > .ui-controlgroup-item {
+	display: block;
+	float: none;
+	width: 100%;
+	margin-top: 0;
+	margin-bottom: 0;
+	text-align: left;
+}
+.ui-controlgroup-vertical .ui-controlgroup-item {
+	box-sizing: border-box;
+}
+.ui-controlgroup .ui-controlgroup-label {
+	padding: .4em 1em;
+}
+.ui-controlgroup .ui-controlgroup-label span {
+	font-size: 80%;
+}
+.ui-controlgroup-horizontal .ui-controlgroup-label + .ui-controlgroup-item {
+	border-left: none;
+}
+.ui-controlgroup-vertical .ui-controlgroup-label + .ui-controlgroup-item {
+	border-top: none;
+}
+.ui-controlgroup-horizontal .ui-controlgroup-label.ui-widget-content {
+	border-right: none;
+}
+.ui-controlgroup-vertical .ui-controlgroup-label.ui-widget-content {
+	border-bottom: none;
+}
+
+/* Spinner specific style fixes */
+.ui-controlgroup-vertical .ui-spinner-input {
+
+	/* Support: IE8 only, Android < 4.4 only */
+	width: 75%;
+	width: calc( 100% - 2.4em );
+}
+.ui-controlgroup-vertical .ui-spinner .ui-spinner-up {
+	border-top-style: solid;
+}
+
+.ui-checkboxradio-label .ui-icon-background {
+	box-shadow: inset 1px 1px 1px #ccc;
+	border-radius: .12em;
+	border: none;
+}
+.ui-checkboxradio-radio-label .ui-icon-background {
+	width: 16px;
+	height: 16px;
+	border-radius: 1em;
+	overflow: visible;
+	border: none;
+}
+.ui-checkboxradio-radio-label.ui-checkboxradio-checked .ui-icon,
+.ui-checkboxradio-radio-label.ui-checkboxradio-checked:hover .ui-icon {
+	background-image: none;
+	width: 8px;
+	height: 8px;
+	border-width: 4px;
+	border-style: solid;
+}
+.ui-checkboxradio-disabled {
+	pointer-events: none;
+}
+.ui-datepicker {
+	width: 17em;
+	padding: .2em .2em 0;
+	display: none;
+}
+.ui-datepicker .ui-datepicker-header {
+	position: relative;
+	padding: .2em 0;
+}
+.ui-datepicker .ui-datepicker-prev,
+.ui-datepicker .ui-datepicker-next {
+	position: absolute;
+	top: 2px;
+	width: 1.8em;
+	height: 1.8em;
+}
+.ui-datepicker .ui-datepicker-prev-hover,
+.ui-datepicker .ui-datepicker-next-hover {
+	top: 1px;
+}
+.ui-datepicker .ui-datepicker-prev {
+	left: 2px;
+}
+.ui-datepicker .ui-datepicker-next {
+	right: 2px;
+}
+.ui-datepicker .ui-datepicker-prev-hover {
+	left: 1px;
+}
+.ui-datepicker .ui-datepicker-next-hover {
+	right: 1px;
+}
+.ui-datepicker .ui-datepicker-prev span,
+.ui-datepicker .ui-datepicker-next span {
+	display: block;
+	position: absolute;
+	left: 50%;
+	margin-left: -8px;
+	top: 50%;
+	margin-top: -8px;
+}
+.ui-datepicker .ui-datepicker-title {
+	margin: 0 2.3em;
+	line-height: 1.8em;
+	text-align: center;
+}
+.ui-datepicker .ui-datepicker-title select {
+	font-size: 1em;
+	margin: 1px 0;
+}
+.ui-datepicker select.ui-datepicker-month,
+.ui-datepicker select.ui-datepicker-year {
+	width: 45%;
+}
+.ui-datepicker table {
+	width: 100%;
+	font-size: .9em;
+	border-collapse: collapse;
+	margin: 0 0 .4em;
+}
+.ui-datepicker th {
+	padding: .7em .3em;
+	text-align: center;
+	font-weight: bold;
+	border: 0;
+}
+.ui-datepicker td {
+	border: 0;
+	padding: 1px;
+}
+.ui-datepicker td span,
+.ui-datepicker td a {
+	display: block;
+	padding: .2em;
+	text-align: right;
+	text-decoration: none;
+}
+.ui-datepicker .ui-datepicker-buttonpane {
+	background-image: none;
+	margin: .7em 0 0 0;
+	padding: 0 .2em;
+	border-left: 0;
+	border-right: 0;
+	border-bottom: 0;
+}
+.ui-datepicker .ui-datepicker-buttonpane button {
+	float: right;
+	margin: .5em .2em .4em;
+	cursor: pointer;
+	padding: .2em .6em .3em .6em;
+	width: auto;
+	overflow: visible;
+}
+.ui-datepicker .ui-datepicker-buttonpane button.ui-datepicker-current {
+	float: left;
+}
+
+/* with multiple calendars */
+.ui-datepicker.ui-datepicker-multi {
+	width: auto;
+}
+.ui-datepicker-multi .ui-datepicker-group {
+	float: left;
+}
+.ui-datepicker-multi .ui-datepicker-group table {
+	width: 95%;
+	margin: 0 auto .4em;
+}
+.ui-datepicker-multi-2 .ui-datepicker-group {
+	width: 50%;
+}
+.ui-datepicker-multi-3 .ui-datepicker-group {
+	width: 33.3%;
+}
+.ui-datepicker-multi-4 .ui-datepicker-group {
+	width: 25%;
+}
+.ui-datepicker-multi .ui-datepicker-group-last .ui-datepicker-header,
+.ui-datepicker-multi .ui-datepicker-group-middle .ui-datepicker-header {
+	border-left-width: 0;
+}
+.ui-datepicker-multi .ui-datepicker-buttonpane {
+	clear: left;
+}
+.ui-datepicker-row-break {
+	clear: both;
+	width: 100%;
+	font-size: 0;
+}
+
+/* RTL support */
+.ui-datepicker-rtl {
+	direction: rtl;
+}
+.ui-datepicker-rtl .ui-datepicker-prev {
+	right: 2px;
+	left: auto;
+}
+.ui-datepicker-rtl .ui-datepicker-next {
+	left: 2px;
+	right: auto;
+}
+.ui-datepicker-rtl .ui-datepicker-prev:hover {
+	right: 1px;
+	left: auto;
+}
+.ui-datepicker-rtl .ui-datepicker-next:hover {
+	left: 1px;
+	right: auto;
+}
+.ui-datepicker-rtl .ui-datepicker-buttonpane {
+	clear: right;
+}
+.ui-datepicker-rtl .ui-datepicker-buttonpane button {
+	float: left;
+}
+.ui-datepicker-rtl .ui-datepicker-buttonpane button.ui-datepicker-current,
+.ui-datepicker-rtl .ui-datepicker-group {
+	float: right;
+}
+.ui-datepicker-rtl .ui-datepicker-group-last .ui-datepicker-header,
+.ui-datepicker-rtl .ui-datepicker-group-middle .ui-datepicker-header {
+	border-right-width: 0;
+	border-left-width: 1px;
+}
+
+/* Icons */
+.ui-datepicker .ui-icon {
+	display: block;
+	text-indent: -99999px;
+	overflow: hidden;
+	background-repeat: no-repeat;
+	left: .5em;
+	top: .3em;
+}
+.ui-dialog {
+	position: absolute;
+	top: 0;
+	left: 0;
+	padding: .2em;
+	outline: 0;
+}
+.ui-dialog .ui-dialog-titlebar {
+	padding: .4em 1em;
+	position: relative;
+}
+.ui-dialog .ui-dialog-title {
+	float: left;
+	margin: .1em 0;
+	white-space: nowrap;
+	width: 90%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.ui-dialog .ui-dialog-titlebar-close {
+	position: absolute;
+	right: .3em;
+	top: 50%;
+	width: 20px;
+	margin: -10px 0 0 0;
+	padding: 1px;
+	height: 20px;
+}
+.ui-dialog .ui-dialog-content {
+	position: relative;
+	border: 0;
+	padding: .5em 1em;
+	background: none;
+	overflow: auto;
+}
+.ui-dialog .ui-dialog-buttonpane {
+	text-align: left;
+	border-width: 1px 0 0 0;
+	background-image: none;
+	margin-top: .5em;
+	padding: .3em 1em .5em .4em;
+}
+.ui-dialog .ui-dialog-buttonpane .ui-dialog-buttonset {
+	float: right;
+}
+.ui-dialog .ui-dialog-buttonpane button {
+	margin: .5em .4em .5em 0;
+	cursor: pointer;
+}
+.ui-dialog .ui-resizable-n {
+	height: 2px;
+	top: 0;
+}
+.ui-dialog .ui-resizable-e {
+	width: 2px;
+	right: 0;
+}
+.ui-dialog .ui-resizable-s {
+	height: 2px;
+	bottom: 0;
+}
+.ui-dialog .ui-resizable-w {
+	width: 2px;
+	left: 0;
+}
+.ui-dialog .ui-resizable-se,
+.ui-dialog .ui-resizable-sw,
+.ui-dialog .ui-resizable-ne,
+.ui-dialog .ui-resizable-nw {
+	width: 7px;
+	height: 7px;
+}
+.ui-dialog .ui-resizable-se {
+	right: 0;
+	bottom: 0;
+}
+.ui-dialog .ui-resizable-sw {
+	left: 0;
+	bottom: 0;
+}
+.ui-dialog .ui-resizable-ne {
+	right: 0;
+	top: 0;
+}
+.ui-dialog .ui-resizable-nw {
+	left: 0;
+	top: 0;
+}
+.ui-draggable .ui-dialog-titlebar {
+	cursor: move;
+}
+.ui-progressbar {
+	height: 2em;
+	text-align: left;
+	overflow: hidden;
+}
+.ui-progressbar .ui-progressbar-value {
+	margin: -1px;
+	height: 100%;
+}
+.ui-progressbar .ui-progressbar-overlay {
+	background: url("data:image/gif;base64,R0lGODlhKAAoAIABAAAAAP///yH/C05FVFNDQVBFMi4wAwEAAAAh+QQJAQABACwAAAAAKAAoAAACkYwNqXrdC52DS06a7MFZI+4FHBCKoDeWKXqymPqGqxvJrXZbMx7Ttc+w9XgU2FB3lOyQRWET2IFGiU9m1frDVpxZZc6bfHwv4c1YXP6k1Vdy292Fb6UkuvFtXpvWSzA+HycXJHUXiGYIiMg2R6W459gnWGfHNdjIqDWVqemH2ekpObkpOlppWUqZiqr6edqqWQAAIfkECQEAAQAsAAAAACgAKAAAApSMgZnGfaqcg1E2uuzDmmHUBR8Qil95hiPKqWn3aqtLsS18y7G1SzNeowWBENtQd+T1JktP05nzPTdJZlR6vUxNWWjV+vUWhWNkWFwxl9VpZRedYcflIOLafaa28XdsH/ynlcc1uPVDZxQIR0K25+cICCmoqCe5mGhZOfeYSUh5yJcJyrkZWWpaR8doJ2o4NYq62lAAACH5BAkBAAEALAAAAAAoACgAAAKVDI4Yy22ZnINRNqosw0Bv7i1gyHUkFj7oSaWlu3ovC8GxNso5fluz3qLVhBVeT/Lz7ZTHyxL5dDalQWPVOsQWtRnuwXaFTj9jVVh8pma9JjZ4zYSj5ZOyma7uuolffh+IR5aW97cHuBUXKGKXlKjn+DiHWMcYJah4N0lYCMlJOXipGRr5qdgoSTrqWSq6WFl2ypoaUAAAIfkECQEAAQAsAAAAACgAKAAAApaEb6HLgd/iO7FNWtcFWe+ufODGjRfoiJ2akShbueb0wtI50zm02pbvwfWEMWBQ1zKGlLIhskiEPm9R6vRXxV4ZzWT2yHOGpWMyorblKlNp8HmHEb/lCXjcW7bmtXP8Xt229OVWR1fod2eWqNfHuMjXCPkIGNileOiImVmCOEmoSfn3yXlJWmoHGhqp6ilYuWYpmTqKUgAAIfkECQEAAQAsAAAAACgAKAAAApiEH6kb58biQ3FNWtMFWW3eNVcojuFGfqnZqSebuS06w5V80/X02pKe8zFwP6EFWOT1lDFk8rGERh1TTNOocQ61Hm4Xm2VexUHpzjymViHrFbiELsefVrn6XKfnt2Q9G/+Xdie499XHd2g4h7ioOGhXGJboGAnXSBnoBwKYyfioubZJ2Hn0RuRZaflZOil56Zp6iioKSXpUAAAh+QQJAQABACwAAAAAKAAoAAACkoQRqRvnxuI7kU1a1UU5bd5tnSeOZXhmn5lWK3qNTWvRdQxP8qvaC+/yaYQzXO7BMvaUEmJRd3TsiMAgswmNYrSgZdYrTX6tSHGZO73ezuAw2uxuQ+BbeZfMxsexY35+/Qe4J1inV0g4x3WHuMhIl2jXOKT2Q+VU5fgoSUI52VfZyfkJGkha6jmY+aaYdirq+lQAACH5BAkBAAEALAAAAAAoACgAAAKWBIKpYe0L3YNKToqswUlvznigd4wiR4KhZrKt9Upqip61i9E3vMvxRdHlbEFiEXfk9YARYxOZZD6VQ2pUunBmtRXo1Lf8hMVVcNl8JafV38aM2/Fu5V16Bn63r6xt97j09+MXSFi4BniGFae3hzbH9+hYBzkpuUh5aZmHuanZOZgIuvbGiNeomCnaxxap2upaCZsq+1kAACH5BAkBAAEALAAAAAAoACgAAAKXjI8By5zf4kOxTVrXNVlv1X0d8IGZGKLnNpYtm8Lr9cqVeuOSvfOW79D9aDHizNhDJidFZhNydEahOaDH6nomtJjp1tutKoNWkvA6JqfRVLHU/QUfau9l2x7G54d1fl995xcIGAdXqMfBNadoYrhH+Mg2KBlpVpbluCiXmMnZ2Sh4GBqJ+ckIOqqJ6LmKSllZmsoq6wpQAAAh+QQJAQABACwAAAAAKAAoAAAClYx/oLvoxuJDkU1a1YUZbJ59nSd2ZXhWqbRa2/gF8Gu2DY3iqs7yrq+xBYEkYvFSM8aSSObE+ZgRl1BHFZNr7pRCavZ5BW2142hY3AN/zWtsmf12p9XxxFl2lpLn1rseztfXZjdIWIf2s5dItwjYKBgo9yg5pHgzJXTEeGlZuenpyPmpGQoKOWkYmSpaSnqKileI2FAAACH5BAkBAAEALAAAAAAoACgAAAKVjB+gu+jG4kORTVrVhRlsnn2dJ3ZleFaptFrb+CXmO9OozeL5VfP99HvAWhpiUdcwkpBH3825AwYdU8xTqlLGhtCosArKMpvfa1mMRae9VvWZfeB2XfPkeLmm18lUcBj+p5dnN8jXZ3YIGEhYuOUn45aoCDkp16hl5IjYJvjWKcnoGQpqyPlpOhr3aElaqrq56Bq7VAAAOw==");
+	height: 100%;
+	filter: alpha(opacity=25); /* support: IE8 */
+	opacity: 0.25;
+}
+.ui-progressbar-indeterminate .ui-progressbar-value {
+	background-image: none;
+}
+.ui-selectmenu-menu {
+	padding: 0;
+	margin: 0;
+	position: absolute;
+	top: 0;
+	left: 0;
+	display: none;
+}
+.ui-selectmenu-menu .ui-menu {
+	overflow: auto;
+	overflow-x: hidden;
+	padding-bottom: 1px;
+}
+.ui-selectmenu-menu .ui-menu .ui-selectmenu-optgroup {
+	font-size: 1em;
+	font-weight: bold;
+	line-height: 1.5;
+	padding: 2px 0.4em;
+	margin: 0.5em 0 0 0;
+	height: auto;
+	border: 0;
+}
+.ui-selectmenu-open {
+	display: block;
+}
+.ui-selectmenu-text {
+	display: block;
+	margin-right: 20px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.ui-selectmenu-button.ui-button {
+	text-align: left;
+	white-space: nowrap;
+	width: 14em;
+}
+.ui-selectmenu-icon.ui-icon {
+	float: right;
+	margin-top: 0;
+}
+.ui-slider {
+	position: relative;
+	text-align: left;
+}
+.ui-slider .ui-slider-handle {
+	position: absolute;
+	z-index: 2;
+	width: 1.2em;
+	height: 1.2em;
+	cursor: default;
+	-ms-touch-action: none;
+	touch-action: none;
+}
+.ui-slider .ui-slider-range {
+	position: absolute;
+	z-index: 1;
+	font-size: .7em;
+	display: block;
+	border: 0;
+	background-position: 0 0;
+}
+
+/* support: IE8 - See #6727 */
+.ui-slider.ui-state-disabled .ui-slider-handle,
+.ui-slider.ui-state-disabled .ui-slider-range {
+	filter: inherit;
+}
+
+.ui-slider-horizontal {
+	height: .8em;
+}
+.ui-slider-horizontal .ui-slider-handle {
+	top: -.3em;
+	margin-left: -.6em;
+}
+.ui-slider-horizontal .ui-slider-range {
+	top: 0;
+	height: 100%;
+}
+.ui-slider-horizontal .ui-slider-range-min {
+	left: 0;
+}
+.ui-slider-horizontal .ui-slider-range-max {
+	right: 0;
+}
+
+.ui-slider-vertical {
+	width: .8em;
+	height: 100px;
+}
+.ui-slider-vertical .ui-slider-handle {
+	left: -.3em;
+	margin-left: 0;
+	margin-bottom: -.6em;
+}
+.ui-slider-vertical .ui-slider-range {
+	left: 0;
+	width: 100%;
+}
+.ui-slider-vertical .ui-slider-range-min {
+	bottom: 0;
+}
+.ui-slider-vertical .ui-slider-range-max {
+	top: 0;
+}
+.ui-spinner {
+	position: relative;
+	display: inline-block;
+	overflow: hidden;
+	padding: 0;
+	vertical-align: middle;
+}
+.ui-spinner-input {
+	border: none;
+	background: none;
+	color: inherit;
+	padding: .222em 0;
+	margin: .2em 0;
+	vertical-align: middle;
+	margin-left: .4em;
+	margin-right: 2em;
+}
+.ui-spinner-button {
+	width: 1.6em;
+	height: 50%;
+	font-size: .5em;
+	padding: 0;
+	margin: 0;
+	text-align: center;
+	position: absolute;
+	cursor: default;
+	display: block;
+	overflow: hidden;
+	right: 0;
+}
+/* more specificity required here to override default borders */
+.ui-spinner a.ui-spinner-button {
+	border-top-style: none;
+	border-bottom-style: none;
+	border-right-style: none;
+}
+.ui-spinner-up {
+	top: 0;
+}
+.ui-spinner-down {
+	bottom: 0;
+}
+.ui-tabs {
+	position: relative;/* position: relative prevents IE scroll bug (element with position: relative inside container with overflow: auto appear as "fixed") */
+	padding: .2em;
+}
+.ui-tabs .ui-tabs-nav {
+	margin: 0;
+	padding: .2em .2em 0;
+}
+.ui-tabs .ui-tabs-nav li {
+	list-style: none;
+	float: left;
+	position: relative;
+	top: 0;
+	margin: 1px .2em 0 0;
+	border-bottom-width: 0;
+	padding: 0;
+	white-space: nowrap;
+}
+.ui-tabs .ui-tabs-nav .ui-tabs-anchor {
+	float: left;
+	padding: .5em 1em;
+	text-decoration: none;
+}
+.ui-tabs .ui-tabs-nav li.ui-tabs-active {
+	margin-bottom: -1px;
+	padding-bottom: 1px;
+}
+.ui-tabs .ui-tabs-nav li.ui-tabs-active .ui-tabs-anchor,
+.ui-tabs .ui-tabs-nav li.ui-state-disabled .ui-tabs-anchor,
+.ui-tabs .ui-tabs-nav li.ui-tabs-loading .ui-tabs-anchor {
+	cursor: text;
+}
+.ui-tabs-collapsible .ui-tabs-nav li.ui-tabs-active .ui-tabs-anchor {
+	cursor: pointer;
+}
+.ui-tabs .ui-tabs-panel {
+	display: block;
+	border-width: 0;
+	padding: 1em 1.4em;
+	background: none;
+}
+.ui-tooltip {
+	padding: 8px;
+	position: absolute;
+	z-index: 9999;
+	max-width: 300px;
+}
+body .ui-tooltip {
+	border-width: 2px;
+}
+
+/* Component containers
+----------------------------------*/
+.ui-widget {
+	font-family: Verdana,Arial,sans-serif;
+	font-size: 1.1em;
+}
+.ui-widget .ui-widget {
+	font-size: 1em;
+}
+.ui-widget input,
+.ui-widget select,
+.ui-widget textarea,
+.ui-widget button {
+	font-family: Verdana,Arial,sans-serif;
+	font-size: 1em;
+}
+.ui-widget.ui-widget-content {
+	border: 1px solid #d3d3d3;
+}
+.ui-widget-content {
+	border: 1px solid #aaaaaa;
+	background: #ffffff;
+	color: #222222;
+}
+.ui-widget-content a {
+	color: #222222;
+}
+.ui-widget-header {
+	border: 1px solid #aaaaaa;
+	background: #cccccc url("images/ui-bg_highlight-soft_75_cccccc_1x100.png") 50% 50% repeat-x;
+	color: #222222;
+	font-weight: bold;
+}
+.ui-widget-header a {
+	color: #222222;
+}
+
+/* Interaction states
+----------------------------------*/
+.ui-state-default,
+.ui-widget-content .ui-state-default,
+.ui-widget-header .ui-state-default,
+.ui-button,
+
+/* We use html here because we need a greater specificity to make sure disabled
+works properly when clicked or hovered */
+html .ui-button.ui-state-disabled:hover,
+html .ui-button.ui-state-disabled:active {
+	border: 1px solid #d3d3d3;
+	background: #e6e6e6 url("images/ui-bg_glass_75_e6e6e6_1x400.png") 50% 50% repeat-x;
+	font-weight: normal;
+	color: #555555;
+}
+.ui-state-default a,
+.ui-state-default a:link,
+.ui-state-default a:visited,
+a.ui-button,
+a:link.ui-button,
+a:visited.ui-button,
+.ui-button {
+	color: #555555;
+	text-decoration: none;
+}
+.ui-state-hover,
+.ui-widget-content .ui-state-hover,
+.ui-widget-header .ui-state-hover,
+.ui-state-focus,
+.ui-widget-content .ui-state-focus,
+.ui-widget-header .ui-state-focus,
+.ui-button:hover,
+.ui-button:focus {
+	border: 1px solid #999999;
+	background: #dadada url("images/ui-bg_glass_75_dadada_1x400.png") 50% 50% repeat-x;
+	font-weight: normal;
+	color: #212121;
+}
+.ui-state-hover a,
+.ui-state-hover a:hover,
+.ui-state-hover a:link,
+.ui-state-hover a:visited,
+.ui-state-focus a,
+.ui-state-focus a:hover,
+.ui-state-focus a:link,
+.ui-state-focus a:visited,
+a.ui-button:hover,
+a.ui-button:focus {
+	color: #212121;
+	text-decoration: none;
+}
+
+.ui-visual-focus {
+	box-shadow: 0 0 3px 1px rgb(94, 158, 214);
+}
+.ui-state-active,
+.ui-widget-content .ui-state-active,
+.ui-widget-header .ui-state-active,
+a.ui-button:active,
+.ui-button:active,
+.ui-button.ui-state-active:hover {
+	border: 1px solid #aaaaaa;
+	background: #ffffff url("images/ui-bg_glass_65_ffffff_1x400.png") 50% 50% repeat-x;
+	font-weight: normal;
+	color: #212121;
+}
+.ui-icon-background,
+.ui-state-active .ui-icon-background {
+	border: #aaaaaa;
+	background-color: #212121;
+}
+.ui-state-active a,
+.ui-state-active a:link,
+.ui-state-active a:visited {
+	color: #212121;
+	text-decoration: none;
+}
+
+/* Interaction Cues
+----------------------------------*/
+.ui-state-highlight,
+.ui-widget-content .ui-state-highlight,
+.ui-widget-header .ui-state-highlight {
+	border: 1px solid #fcefa1;
+	background: #fbf9ee url("images/ui-bg_glass_55_fbf9ee_1x400.png") 50% 50% repeat-x;
+	color: #363636;
+}
+.ui-state-checked {
+	border: 1px solid #fcefa1;
+	background: #fbf9ee;
+}
+.ui-state-highlight a,
+.ui-widget-content .ui-state-highlight a,
+.ui-widget-header .ui-state-highlight a {
+	color: #363636;
+}
+.ui-state-error,
+.ui-widget-content .ui-state-error,
+.ui-widget-header .ui-state-error {
+	border: 1px solid #cd0a0a;
+	background: #fef1ec url("images/ui-bg_glass_95_fef1ec_1x400.png") 50% 50% repeat-x;
+	color: #cd0a0a;
+}
+.ui-state-error a,
+.ui-widget-content .ui-state-error a,
+.ui-widget-header .ui-state-error a {
+	color: #cd0a0a;
+}
+.ui-state-error-text,
+.ui-widget-content .ui-state-error-text,
+.ui-widget-header .ui-state-error-text {
+	color: #cd0a0a;
+}
+.ui-priority-primary,
+.ui-widget-content .ui-priority-primary,
+.ui-widget-header .ui-priority-primary {
+	font-weight: bold;
+}
+.ui-priority-secondary,
+.ui-widget-content .ui-priority-secondary,
+.ui-widget-header .ui-priority-secondary {
+	opacity: .7;
+	filter:Alpha(Opacity=70); /* support: IE8 */
+	font-weight: normal;
+}
+.ui-state-disabled,
+.ui-widget-content .ui-state-disabled,
+.ui-widget-header .ui-state-disabled {
+	opacity: .35;
+	filter:Alpha(Opacity=35); /* support: IE8 */
+	background-image: none;
+}
+.ui-state-disabled .ui-icon {
+	filter:Alpha(Opacity=35); /* support: IE8 - See #6059 */
+}
+
+/* Icons
+----------------------------------*/
+
+/* states and images */
+.ui-icon {
+	width: 16px;
+	height: 16px;
+}
+.ui-icon,
+.ui-widget-content .ui-icon {
+	background-image: url("images/ui-icons_222222_256x240.png");
+}
+.ui-widget-header .ui-icon {
+	background-image: url("images/ui-icons_222222_256x240.png");
+}
+.ui-state-hover .ui-icon,
+.ui-state-focus .ui-icon,
+.ui-button:hover .ui-icon,
+.ui-button:focus .ui-icon {
+	background-image: url("images/ui-icons_454545_256x240.png");
+}
+.ui-state-active .ui-icon,
+.ui-button:active .ui-icon {
+	background-image: url("images/ui-icons_454545_256x240.png");
+}
+.ui-state-highlight .ui-icon,
+.ui-button .ui-state-highlight.ui-icon {
+	background-image: url("images/ui-icons_2e83ff_256x240.png");
+}
+.ui-state-error .ui-icon,
+.ui-state-error-text .ui-icon {
+	background-image: url("images/ui-icons_cd0a0a_256x240.png");
+}
+.ui-button .ui-icon {
+	background-image: url("images/ui-icons_888888_256x240.png");
+}
+
+/* positioning */
+.ui-icon-blank { background-position: 16px 16px; }
+.ui-icon-caret-1-n { background-position: 0 0; }
+.ui-icon-caret-1-ne { background-position: -16px 0; }
+.ui-icon-caret-1-e { background-position: -32px 0; }
+.ui-icon-caret-1-se { background-position: -48px 0; }
+.ui-icon-caret-1-s { background-position: -65px 0; }
+.ui-icon-caret-1-sw { background-position: -80px 0; }
+.ui-icon-caret-1-w { background-position: -96px 0; }
+.ui-icon-caret-1-nw { background-position: -112px 0; }
+.ui-icon-caret-2-n-s { background-position: -128px 0; }
+.ui-icon-caret-2-e-w { background-position: -144px 0; }
+.ui-icon-triangle-1-n { background-position: 0 -16px; }
+.ui-icon-triangle-1-ne { background-position: -16px -16px; }
+.ui-icon-triangle-1-e { background-position: -32px -16px; }
+.ui-icon-triangle-1-se { background-position: -48px -16px; }
+.ui-icon-triangle-1-s { background-position: -65px -16px; }
+.ui-icon-triangle-1-sw { background-position: -80px -16px; }
+.ui-icon-triangle-1-w { background-position: -96px -16px; }
+.ui-icon-triangle-1-nw { background-position: -112px -16px; }
+.ui-icon-triangle-2-n-s { background-position: -128px -16px; }
+.ui-icon-triangle-2-e-w { background-position: -144px -16px; }
+.ui-icon-arrow-1-n { background-position: 0 -32px; }
+.ui-icon-arrow-1-ne { background-position: -16px -32px; }
+.ui-icon-arrow-1-e { background-position: -32px -32px; }
+.ui-icon-arrow-1-se { background-position: -48px -32px; }
+.ui-icon-arrow-1-s { background-position: -65px -32px; }
+.ui-icon-arrow-1-sw { background-position: -80px -32px; }
+.ui-icon-arrow-1-w { background-position: -96px -32px; }
+.ui-icon-arrow-1-nw { background-position: -112px -32px; }
+.ui-icon-arrow-2-n-s { background-position: -128px -32px; }
+.ui-icon-arrow-2-ne-sw { background-position: -144px -32px; }
+.ui-icon-arrow-2-e-w { background-position: -160px -32px; }
+.ui-icon-arrow-2-se-nw { background-position: -176px -32px; }
+.ui-icon-arrowstop-1-n { background-position: -192px -32px; }
+.ui-icon-arrowstop-1-e { background-position: -208px -32px; }
+.ui-icon-arrowstop-1-s { background-position: -224px -32px; }
+.ui-icon-arrowstop-1-w { background-position: -240px -32px; }
+.ui-icon-arrowthick-1-n { background-position: 1px -48px; }
+.ui-icon-arrowthick-1-ne { background-position: -16px -48px; }
+.ui-icon-arrowthick-1-e { background-position: -32px -48px; }
+.ui-icon-arrowthick-1-se { background-position: -48px -48px; }
+.ui-icon-arrowthick-1-s { background-position: -64px -48px; }
+.ui-icon-arrowthick-1-sw { background-position: -80px -48px; }
+.ui-icon-arrowthick-1-w { background-position: -96px -48px; }
+.ui-icon-arrowthick-1-nw { background-position: -112px -48px; }
+.ui-icon-arrowthick-2-n-s { background-position: -128px -48px; }
+.ui-icon-arrowthick-2-ne-sw { background-position: -144px -48px; }
+.ui-icon-arrowthick-2-e-w { background-position: -160px -48px; }
+.ui-icon-arrowthick-2-se-nw { background-position: -176px -48px; }
+.ui-icon-arrowthickstop-1-n { background-position: -192px -48px; }
+.ui-icon-arrowthickstop-1-e { background-position: -208px -48px; }
+.ui-icon-arrowthickstop-1-s { background-position: -224px -48px; }
+.ui-icon-arrowthickstop-1-w { background-position: -240px -48px; }
+.ui-icon-arrowreturnthick-1-w { background-position: 0 -64px; }
+.ui-icon-arrowreturnthick-1-n { background-position: -16px -64px; }
+.ui-icon-arrowreturnthick-1-e { background-position: -32px -64px; }
+.ui-icon-arrowreturnthick-1-s { background-position: -48px -64px; }
+.ui-icon-arrowreturn-1-w { background-position: -64px -64px; }
+.ui-icon-arrowreturn-1-n { background-position: -80px -64px; }
+.ui-icon-arrowreturn-1-e { background-position: -96px -64px; }
+.ui-icon-arrowreturn-1-s { background-position: -112px -64px; }
+.ui-icon-arrowrefresh-1-w { background-position: -128px -64px; }
+.ui-icon-arrowrefresh-1-n { background-position: -144px -64px; }
+.ui-icon-arrowrefresh-1-e { background-position: -160px -64px; }
+.ui-icon-arrowrefresh-1-s { background-position: -176px -64px; }
+.ui-icon-arrow-4 { background-position: 0 -80px; }
+.ui-icon-arrow-4-diag { background-position: -16px -80px; }
+.ui-icon-extlink { background-position: -32px -80px; }
+.ui-icon-newwin { background-position: -48px -80px; }
+.ui-icon-refresh { background-position: -64px -80px; }
+.ui-icon-shuffle { background-position: -80px -80px; }
+.ui-icon-transfer-e-w { background-position: -96px -80px; }
+.ui-icon-transferthick-e-w { background-position: -112px -80px; }
+.ui-icon-folder-collapsed { background-position: 0 -96px; }
+.ui-icon-folder-open { background-position: -16px -96px; }
+.ui-icon-document { background-position: -32px -96px; }
+.ui-icon-document-b { background-position: -48px -96px; }
+.ui-icon-note { background-position: -64px -96px; }
+.ui-icon-mail-closed { background-position: -80px -96px; }
+.ui-icon-mail-open { background-position: -96px -96px; }
+.ui-icon-suitcase { background-position: -112px -96px; }
+.ui-icon-comment { background-position: -128px -96px; }
+.
