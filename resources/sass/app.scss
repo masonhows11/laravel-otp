@@ -1,7 +1,9 @@
-// Fonts
 
-
-// Variables
+// font-awesome
+@import "~@fortawesome/fontawesome-free/scss/fontawesome";
+@import "~@fortawesome/fontawesome-free/scss/regular";
+@import "~@fortawesome/fontawesome-free/scss/solid";
+@import "~@fortawesome/fontawesome-free/scss/brands";
 
 
 // Bootstrap
@@ -387,4 +389,77 @@ body {
 }
 .alert-section {
     height: 100px;
+}
+
+
+/**************** media query *****************/
+/* On smaller screens, where height is less than 450px, change the style of the sidenav (less padding and a smaller font size) */
+@media screen and (max-height: 450px) {
+    .sidenav {
+        padding-top: 15px;
+    }
+    .sidenav a {
+        font-size: 18px;
+    }
+}
+
+@media screen and (min-width: 768px) {
+    .nav-side li {
+        text-align: center;
+    }
+    .sidenav {
+        display: none !important;
+    }
+}
+
+@media screen and (max-width: 576px) {
+    .header-up-item {
+        display: none;
+    }
+    .nav-up {
+        display: flex;
+        flex-flow: row-reverse;
+    }
+    .navbar .nav-down {
+        display: none;
+    }
+    .sidenav-open {
+        display: block;
+    }
+    .sidenav-open .fa-bars {
+        color: #3195FF;
+    }
+    .nav-up {
+        border-bottom: none;
+    }
+    .nav-side li {
+        text-align: center;
+    }
+    .intro-desc p {
+        font-size: 1rem;
+    }
+
+}
+
+@media (max-width: 576px) {
+
+    .normal-contact,
+    .social-link {
+        display: flex;
+        flex-direction: column !important;
+    }
+    .normal-contact .normal-contact-item,
+    .social-link .social-link-item {
+        margin: 5px 0 5px 0;
+    }
+
+    .dash-index-info .info-value{
+        font-size: 0.8rem;
+    }
+}
+
+@media screen and (max-width: 768px) {
+    .nav-side li {
+        text-align: center;
+    }
 }
