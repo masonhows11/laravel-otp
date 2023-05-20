@@ -1,15 +1,6 @@
-<!DOCTYPE html>
-<html lang="{{ str_replace('_', '-', app()->getLocale()) }}">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-
-        <title>{{ env('APP_NAME')  }}</title>
-
-    </head>
-    <body class="container">
-
-
-
-    </body>
-</html>
+@extends('include_front.master')
+@section('title_front')
+    {{ env('APP_NAME')  }}
+@endsection
+@section('main_content_front')
+@endsection
