@@ -8,4 +8,14 @@ use Illuminate\Http\Request;
 class RegisterController extends Controller
 {
     //
+
+    public function registerForm()
+    {
+        
+    }
+
+    public function register()
+    {
+        
+    }
 }
