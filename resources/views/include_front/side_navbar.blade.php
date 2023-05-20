@@ -20,7 +20,6 @@
                 <a href="{{ route('register.form') }}" class="nav-link">ثبت نام</a>
             </li>
         @endif
-
         <li class="nav-item">
             <a class="nav-link" href="#" >درباره ما</a>
         </li>

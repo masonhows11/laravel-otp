@@ -39,10 +39,10 @@
         </ul>
         <ul class="navbar-nav header-down-item-left">
             <li class="nav-item">
-                <a class="nav-link about-us" href="{{ route('aboutUs') }}">درباره ما</a>
+                <a class="nav-link about-us" href="#">درباره ما</a>
             </li>
             <li class="nav-item">
-                <a class="nav-link contact-us" href="{{ route('contactUs') }}">ارتباط با ما</a>
+                <a class="nav-link contact-us" href="#">ارتباط با ما</a>
             </li>
         </ul>
     </div>
