@@ -3,7 +3,7 @@
     ورود
 @endsection
 @section('main_content_front')
-    <div class="container login-section">
+    <div class="login-section">
 
         <div class="alert-section mt-2">
             @include('include_front.alert')
@@ -11,14 +11,10 @@
 
         <div class="row d-flex  justify-content-center mb-5 mt-2">
 
-            <div class="col-xl-5 col-lg-5 col-md-5 px-4">
-                <div class="row d-flex flex-column">
 
-                    <div class="col-xl-10 col-lg-10 my-3 col-md-10  border border-2 login-form-title rounded-3 py-4">
-                        <h3 class="text-center">ورود به وب سولو</h3>
-                    </div>
 
-                    <div class="col-xl-10 col-lg-10 col-md-10 border border-2  rounded-3 py-4 px-4 login-form">
+
+                    <div class="col-xl-6 col-lg-6 col-md-6  border border-2  rounded-3 py-4 px-4 login-form">
                         <form action="{{ route('login') }}" method="post">
                             @csrf
                             <div class="mb-3 mt-3">
@@ -47,9 +43,8 @@
                             <button type="submit" class="btn btn-login w3-flat-alizarin rounded-3">ورود</button>
                         </form>
                     </div>
-                </div>
 
-            </div>
+
 
         </div>
 

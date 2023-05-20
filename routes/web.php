@@ -15,6 +15,7 @@ use App\Http\Controllers\HomeController;
 |
 */
 
+// make storage link
 Route::get('/storage-link',function(){
     symlink(storage_path('app/public'),$_SERVER['DOCUMENT_ROOT'].'/storage');
 });

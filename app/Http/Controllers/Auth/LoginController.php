@@ -11,7 +11,7 @@ class LoginController extends Controller
 
     public function loginForm()
     {
-
+            return view('auth_front.login');
     }
 
     public function login(){

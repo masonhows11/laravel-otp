@@ -16,7 +16,7 @@
                     <ul class="dropdown-menu w3-flat-clouds">
                         <li><a class="dropdown-item" href="{{ route('dashboard') }}">{{ \Illuminate\Support\Facades\Auth::user()->name }}</a></li>
                         <li><hr class="dropdown-divider"></li>
-                        <li><a class="dropdown-item" href="{{ route('dashboard') }}">حساب کاربری</a></li>
+                        <li><a class="dropdown-item" href="#">حساب کاربری</a></li>
                         <li><hr class="dropdown-divider"></li>
                         <li><a class="dropdown-item" href="{{ route('logout') }}">خروج</a></li>
                     </ul>

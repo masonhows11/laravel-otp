@@ -11,11 +11,11 @@ class RegisterController extends Controller
 
     public function registerForm()
     {
-        
+        return view('auth_front.register');
     }
 
-    public function register()
+    public function register(Request $request)
     {
-        
+
     }
 }
