@@ -78,7 +78,106 @@
     font-family: 'iransans_num_light';
     src: url("../fonts/number/IRANSansDN_FaNum_Light.ttf") format('truetype');
 }
+/* color flat ui */
+.w3-flat-turquoise {
+    color: #fff !important;
+    background-color: #1abc9c !important
+}
 
+.w3-flat-emerald {
+    color: #fff !important;
+    background-color: #2ecc71 !important
+}
+
+.w3-flat-peter-river {
+    color: #fff !important;
+    background-color: #3498db !important
+}
+
+.w3-flat-amethyst {
+    color: #fff !important;
+    background-color: #9b59b6 !important
+}
+
+.w3-flat-wet-asphalt {
+    color: #fff !important;
+    background-color: #34495e !important
+}
+
+.w3-flat-green-sea {
+    color: #fff !important;
+    background-color: #16a085 !important
+}
+
+.w3-flat-nephritis {
+    color: #fff !important;
+    background-color: #27ae60 !important
+}
+
+.w3-flat-belize-hole {
+    color: #fff !important;
+    background-color: #2980b9 !important
+}
+
+.w3-flat-wisteria {
+    color: #fff !important;
+    background-color: #8e44ad !important
+}
+
+.w3-flat-midnight-blue {
+    color: #fff !important;
+    background-color: #2c3e50 !important
+}
+
+.w3-flat-sun-flower {
+    color: #fff !important;
+    background-color: #f1c40f !important
+}
+
+.w3-flat-carrot {
+    color: #fff !important;
+    background-color: #e67e22 !important
+}
+
+.w3-flat-alizarin {
+    color: #fff !important;
+    background-color: #e74c3c !important
+}
+
+.w3-flat-clouds {
+    color: #000 !important;
+    background-color: #ecf0f1 !important
+}
+
+.w3-flat-concrete {
+    color: #fff !important;
+    background-color: #95a5a6 !important
+}
+
+.w3-flat-orange {
+    color: #fff !important;
+    background-color: #f39c12 !important
+}
+
+.w3-flat-pumpkin {
+    color: #fff !important;
+    background-color: #d35400 !important
+}
+
+.w3-flat-pomegranate {
+    color: #fff !important;
+    background-color: #c0392b !important
+}
+
+.w3-flat-silver {
+    color: #000 !important;
+    background-color: #bdc3c7 !important
+}
+
+.w3-flat-asbestos {
+    color: #fff !important;
+    background-color: #7f8c8d !important
+}
 // custom styles
 html {
     height: 100%;
@@ -90,4 +189,202 @@ body {
     flex-direction: column;
     font-family: 'iransansdn', sans-serif;
 
+}
+
+.header-up-item a {
+    line-height: 1.8em;
+}
+
+.header-up-item .nav-link,
+.header-down-item-left .nav-link,
+.header-down-item-right .nav-link,
+.btn-auth-sec .btn {
+    font-family: 'iransansbold', Tahoma;
+    color: #111111;
+}
+
+.header-up-item .dropdown:hover ul.dropdown-menu {
+    display: block;
+}
+
+.header-up-item .fa-shopping-basket {
+    font-size: 1.8rem;
+    color: orangered;
+}
+
+.header-up-item .dropdown {
+    margin-left: 70px;
+}
+
+.header-up-item.btn {
+    background-color: transparent;
+}
+
+.header-up-item .dropdown-menu li a {
+    font-weight: bold;
+}
+
+.header-up-item .dropdown-menu li a:hover {
+    color: tomato;
+}
+
+.nav-up {
+    border-bottom: 2px solid #51585e;
+}
+
+.navbar-brand {
+    font-family: iransans_num_bold, sans-serif;
+    color: #3195FF !important;
+    font-weight: bold;
+    font-size: 1.8rem;
+}
+
+.nav-sign-up .nav-link:hover,
+.nav-sign-in .nav-link:hover {
+    color: tomato;
+}
+/* footer */
+/* footer */
+.footer-wrapper {
+    height: auto;
+    margin-top: auto;
+}
+.footer-project-order div a {
+    font-family: iransansdn, sans-serif;
+    color: #ffffff;
+    text-decoration: none;
+    font-size: 1.5rem;
+}
+.footer-project-order div a:hover {
+    color: #ff253a;
+}
+.footer-project-order div {
+    height: 70px;
+    border-radius: 5px;
+}
+.footer-content {
+    margin-top: 20px;
+}
+.footer-content .footer-news, .footer-links {
+    height: auto;
+}
+.footer-news input[type='text'],
+.footer-news input[type='email'] {
+    text-align: right;
+    font-family: iransansdn, sans-serif;
+    font-size: 1rem;
+    color: black !important;
+}
+.footer-news .btn-light {
+    font-family: iransansdn, sans-serif;
+    background: tomato;
+    color: #e7f1ff;
+}
+.footer-project-order div {
+    border: 2px solid #51585e;
+}
+.footer-links,
+.footer-news {
+    border-bottom: 2px solid #51585e;
+}
+.footer-news label {
+    font-family: iransansdn, sans-serif;
+}
+.footer-links .enamad {
+    height: 150px;
+    width: 150px;
+    font-family: iransansdn, sans-serif;
+    color: #ffffff;
+    border: 2px solid #51585e;
+    border-radius: 5px;
+}
+.contact-us-links .fa-instagram,
+.fa-whatsapp,
+.fa-telegram {
+    color: #ffffff;
+    font-size: 2rem;
+}
+.fa-phone {
+    color: #ffffff;
+    font-size: 1.5rem;
+}
+.contact-us-links span {
+    font-family: iransans_num, sans-serif;
+    width: 150px;
+    text-align: left;
+    direction: ltr;
+}
+.contact-link {
+    margin: 10px 0 8px 0;
+}
+.footer-copy-right {
+    color: #ffffff;
+    height: auto;
+    border-top: 2px solid #51585e;
+    margin-top: 30px;
+}
+.footer-copy-right .rule-desc {
+    font-family: iransansdn, sans-serif;
+}
+/* The side navigation menu */
+.sidenav-open {
+    display: none;
+}
+
+.sidenav {
+    height: 100%; /* 100% Full-height */
+    width: 0; /* 0 width - change this with JavaScript */
+    position: fixed; /* Stay in place */
+    z-index: 1; /* Stay on top */
+    top: 0; /* Stay at the top */
+    right: 0;
+    background-color: #1f1f1f; /* Black*/
+    overflow-x: hidden; /* Disable horizontal scroll */
+    padding-top: 60px; /* Place content 60px from the top */
+    /*transition: ease 0.3s; !* 0.5 second transition effect to slide in the sidenav *!*/
+}
+
+/******************** The navigation menu links *********************/
+.sidenav a {
+    padding: 8px 8px 8px 32px;
+    text-decoration: none;
+    font-size: 25px;
+    color: #818181;
+    display: block;
+    transition: 0.3s;
+}
+
+/* When you mouse over the navigation links, change their color */
+.sidenav a:hover {
+    color: #f1f1f1;
+}
+
+/* Position and style the close button (top right corner) */
+.sidenav .closebtn {
+    position: absolute;
+    top: 0;
+    right: 25px;
+    font-size: 36px;
+    margin-left: 50px;
+}
+
+/* auth blades style */
+.login-section .btn-login,
+.register-section .btn-register {
+    width: 80px;
+    color: #ffffff;
+    font-weight: lighter !important;
+}
+.login-form ,
+.register-form ,
+.login-form-title ,
+.register-form-title{
+    border-color:#bdc3c7;
+}
+
+.profile-alert{
+    height: 70px;
+}
+.alert-section {
+    height: 100px;
 }
