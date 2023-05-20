@@ -1,12 +1,12 @@
-@extends('front.include.master_auth')
-@section('page_title')
+@extends('include_front.master')
+@section('title_front')
     ثبت نام
 @endsection
 @section('main_content')
     <div class="container register-section">
 
         <div class="alert-section mt-2">
-            @include('front.include.alert')
+            @include('include_front.alert')
         </div>
 
         <div class="row d-flex justify-content-center mb-5 mt-2">
