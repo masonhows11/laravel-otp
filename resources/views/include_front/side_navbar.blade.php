@@ -20,20 +20,12 @@
                 <a href="{{ route('register.form') }}" class="nav-link">ثبت نام</a>
             </li>
         @endif
+
         <li class="nav-item">
-            <a class="nav-link" href="{{ route('sample.index') }}">نمونه کارها</a>
+            <a class="nav-link" href="#" >درباره ما</a>
         </li>
         <li class="nav-item">
-            <a class="nav-link" href="{{ route('article.index') }}">مقالات</a>
-        </li>
-        <li class="nav-item">
-            <a class="nav-link" href="{{ route('training.index')}}">آموزش ها</a>
-        </li>
-        <li class="nav-item">
-            <a class="nav-link" href="{{ route('aboutUs') }}" >درباره ما</a>
-        </li>
-        <li class="nav-item">
-            <a class="nav-link" href="{{ route('contactUs') }}" >ارتباط با ما</a>
+            <a class="nav-link" href="#" >ارتباط با ما</a>
         </li>
     </ul>
 

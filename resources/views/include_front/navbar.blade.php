@@ -36,15 +36,6 @@
             <li class="nav-item">
                 <a class="nav-link" href="{{ route('home') }}">خانه</a>
             </li>
-            <li class="nav-item">
-                <a class="nav-link" href="{{ route('sample.index') }}">نمونه کارها</a>
-            </li>
-            <li class="nav-item">
-                <a class="nav-link" href="{{ route('article.index') }}">مقالات</a>
-            </li>
-            <li class="nav-item">
-                <a class="nav-link" href="{{ route('training.index') }}">آموزش ها</a>
-            </li>
         </ul>
         <ul class="navbar-nav header-down-item-left">
             <li class="nav-item">
