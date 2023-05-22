@@ -25,8 +25,8 @@ class LoginUserRequest extends FormRequest
     public function rules()
     {
         return [
-            'mobile' => ['required','unique:users',new MobileValidationRule()],
-            'token' => ['required','digits:6']
+            'mobile' => ['required','exists:users',new MobileValidationRule()],
+            //'token' => ['required','digits:6']
         ];
     }
 
@@ -39,10 +39,10 @@ class LoginUserRequest extends FormRequest
     {
         return [
             'mobile.required' => 'شماره موبایل خود را وارد کنید.',
-            'mobile.unique' => 'شماره موبایل وارد شده تکراری است.',
+            'mobile.exists' => 'شماره موبایل وارد شده وجود ندارد.',
 
-            'token.required' => 'کد فعال سازی الزامی است.',
-            'token.digits' => 'کد فعال سازی معتبر نمی باشد.',
+//            'token.required' => 'کد فعال سازی الزامی است.',
+//            'token.digits' => 'کد فعال سازی معتبر نمی باشد.',
         ];
     }
 

@@ -17,5 +17,6 @@ class LoginController extends Controller
 
     public function login(LoginUserRequest $request){
 
+        return $request;
     }
 }
