@@ -19,8 +19,8 @@ class GenerateToken
 
     }
 
-    public static function existToken($code)
+    public static function existToken($token)
     {
-        return User::where('code',$code)->exists();
+        return User::where('token',$token)->exists();
     }
 }
