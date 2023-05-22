@@ -2,6 +2,7 @@
 
 namespace App\Http\Requests;
 
+use App\Rules\MobileValidationRule;
 use Illuminate\Foundation\Http\FormRequest;
 
 class LoginUserRequest extends FormRequest
@@ -24,7 +25,21 @@ class LoginUserRequest extends FormRequest
     public function rules()
     {
         return [
-            //
+            'mobile' => ['required','unique:users',new MobileValidationRule()],
         ];
     }
+
+    /**
+     * Get the error messages for the defined validation rules.
+     *
+     * @return array
+     */
+    public function messages()
+    {
+        return [
+            'mobile.required' => 'شماره موبایل خود را وارد کنید.',
+            'mobile.unique' => 'شماره موبایل وارد شده تکراری است.',
+        ];
+    }
+
 }

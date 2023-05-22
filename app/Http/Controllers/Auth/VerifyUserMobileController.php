@@ -5,7 +5,7 @@ namespace App\Http\Controllers\Auth;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 
-class VerifyUserController extends Controller
+class VerifyUserMobileController extends Controller
 {
     //
 }
