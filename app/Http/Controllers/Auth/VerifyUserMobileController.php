@@ -17,7 +17,7 @@ class VerifyUserMobileController extends Controller
         return view('auth_front.verify_mobile');
     }
 
-    public function verifiedMobile(Request $request)
+    public function verifiedMobile(VerifyUserMobileController $request)
     {
 
         $expire = CheckExpireToken::checkAdminToken($request->token, $request->mobile);
