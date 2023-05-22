@@ -14,14 +14,16 @@
 
 
             <div class="col-xl-6 col-lg-6 col-md-6   border border-2  rounded-3 py-4 px-4 register-form">
-                <form action="{{ route('register') }}" method="post">
+                <form action="{{ route('verified.mobile') }}" method="post">
                     @csrf
 
 
 
                     <div class="mb-3 mt-3">
                         <label for="mobile" class="form-label">موبایل</label>
-                        <input type="text" class="@error('mobile') is_invalid @enderror form-control" dir="ltr" id="mobile"
+                        <input type="text" class="@error('mobile') is_invalid @enderror form-control"
+                               dir="ltr"
+                               id="mobile"
                                name="mobile" value="{{ old('mobile') }}">
                     </div>
                     @error('mobile')
@@ -30,7 +32,8 @@
 
                     <div class="mb-3 mt-3">
                         <label for="token" class="form-label">کد فعال سازی</label>
-                        <input type="text" class="@error('token') is_invalid @enderror form-control" id="token"
+                        <input type="text" class="@error('token') is_invalid @enderror form-control"
+                               id="token"
                                name="token" value="{{ old('email') }}">
                     </div>
                     @error('token')

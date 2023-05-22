@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Auth;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\VerifiedUserRequest;
 use App\Models\User;
 use App\Services\CheckExpireToken;
 use Illuminate\Http\Request;
@@ -17,10 +18,11 @@ class VerifyUserMobileController extends Controller
         return view('auth_front.verify_mobile');
     }
 
-    public function verifiedMobile(VerifyUserMobileController $request)
+    public function verifiedMobile(VerifiedUserRequest $request)
     {
 
-        $expire = CheckExpireToken::checkAdminToken($request->token, $request->mobile);
+
+        $expire = CheckExpireToken::checkExpireToken($request->token, $request->mobile);
 
         if ($expire == false) {
             return redirect()

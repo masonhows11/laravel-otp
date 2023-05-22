@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\Date;
 class CheckExpireToken
 {
 
-    public static function checkAdminToken($token,$mobile)
+    public static function checkExpireToken($token,$mobile)
     {
         try {
             $user = User::where('mobile',$mobile)
