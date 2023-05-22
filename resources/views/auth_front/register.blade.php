@@ -19,7 +19,7 @@
 
                         <div class="mb-3 mt-3">
                             <label for="name" class="form-label">نام کاربری</label>
-                            <input type="text" class="@error('name') is-invalid @enderror form-control" id="name"
+                            <input type="text" class="@error('name') is-invalid @enderror form-control"  id="name"
                                    name="name" value="{{ old('name') }}">
                         </div>
                         @error('name')
@@ -28,7 +28,7 @@
 
                         <div class="mb-3 mt-3">
                             <label for="mobile" class="form-label">موبایل</label>
-                            <input type="text" class="@error('mobile') is_invalid @enderror form-control" id="mobile"
+                            <input type="text" class="@error('mobile') is_invalid @enderror form-control" dir="ltr" id="mobile"
                                    name="mobile" value="{{ old('mobile') }}">
                         </div>
                         @error('mobile')

@@ -17,6 +17,8 @@ class RegisterController extends Controller
 
     public function register(RegisterUserRequest $request)
     {
+        $validated =  $request->validated();
+
 
     }
 }
