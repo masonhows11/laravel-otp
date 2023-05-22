@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\Auth\RegisterController;
+use App\Http\Controllers\Auth\VerifyUserMobileController;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\HomeController;
 /*
@@ -28,6 +29,7 @@ Route::post('/login', [LoginController::class, 'login'])->name('login');//->midd
 
 Route::get('/register/form', [RegisterController::class, 'registerForm'])->name('register.form');
 Route::post('/register', [RegisterController::class, 'register'])->name('register');
+Route::get('/verified-mobile',[VerifyUserMobileController::class,'verifiedMobile'])->name('verified.mobile');
 
 
 

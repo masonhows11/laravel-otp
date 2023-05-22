@@ -19,10 +19,7 @@ class RegisterController extends Controller
 
     public function register(RegisterUserRequest $request)
     {
-        $validated = $request->validated();
-
         $token = GenerateToken::generateToken();
-
         $user = User::create([
             'name' => $request->name,
             'mobile' => $request->mobile,
@@ -30,7 +27,8 @@ class RegisterController extends Controller
             'token' => $token
         ]);
 
-        return $user;
+
+
 
 
     }
