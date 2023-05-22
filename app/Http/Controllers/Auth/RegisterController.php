@@ -27,6 +27,6 @@ class RegisterController extends Controller
             'token' => $token
         ]);
 
-
+        return redirect()->route('verified.mobile.form');
     }
 }
