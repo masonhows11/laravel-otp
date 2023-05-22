@@ -8,9 +8,14 @@ use Illuminate\Http\Request;
 class VerifyUserMobileController extends Controller
 {
     //
-    public function verifiedMobile(Request $request)
+    public function verifiedMobileForm(Request $request)
     {
 
+        return view('auth_front.verify_mobile');
+    }
+
+    public function verifiedMobile(Request $request)
+    {
 
 
     }
