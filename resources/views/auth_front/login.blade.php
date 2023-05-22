@@ -30,7 +30,7 @@
                             <input class="form-check-input" type="checkbox" name="remember"> منو فراموش نکن !
                         </label>
                     </div>
-                    <button type="submit" class="btn btn-login w3-flat-alizarin rounded-3">ورود</button>
+                    <button type="submit" class="btn btn-success btn-login rounded-3">ورود</button>
                 </form>
             </div>
 

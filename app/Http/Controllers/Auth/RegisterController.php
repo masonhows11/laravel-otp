@@ -20,5 +20,6 @@ class RegisterController extends Controller
         $validated =  $request->validated();
 
 
+
     }
 }

@@ -45,7 +45,7 @@
                         @enderror
 
 
-                        <button type="submit" class="btn btn-register  w3-flat-alizarin rounded-3">ثبت نام</button>
+                        <button type="submit" class="btn btn-success  btn-register rounded-3">ثبت نام</button>
                     </form>
                 </div>
 
