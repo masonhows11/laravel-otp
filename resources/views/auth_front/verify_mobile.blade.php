@@ -38,8 +38,13 @@
                     <div class="alert alert-danger">{{ $message }}</div>
                     @enderror
 
-
-                    <button type="submit" class="btn btn-success  btn-register rounded-3">تایید کد</button>
+                    <div class="form-check mb-3">
+                        <label class="form-check-label">
+                            <input class="form-check-input" type="checkbox" name="remember"> منو فراموش نکن !
+                        </label>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-success  btn-register rounded-3">ورود</button>
 
                     <a href="{{ route('login.form') }}" class="btn btn-light">ارسال مجدد کد فعال سازی</a>
                 </form>

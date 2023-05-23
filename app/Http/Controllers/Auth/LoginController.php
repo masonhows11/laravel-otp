@@ -36,8 +36,12 @@ class LoginController extends Controller
             } else {
 
                 User::create([
-                   'mobile'
+                   'mobile' => $request->mobile,
+                    'token' => $token,
                 ]);
+
+                return redirect()->route('verified.mobile.form');
+
             }
 
 

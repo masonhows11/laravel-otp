@@ -25,12 +25,8 @@
                     @enderror
 
 
-                    <div class="form-check mb-3">
-                        <label class="form-check-label">
-                            <input class="form-check-input" type="checkbox" name="remember"> منو فراموش نکن !
-                        </label>
-                    </div>
-                    <button type="submit" class="btn btn-success btn-login rounded-3">ورود</button>
+
+                    <button type="submit" class="btn btn-success btn-login rounded-3">ادامه</button>
                 </form>
             </div>
 
