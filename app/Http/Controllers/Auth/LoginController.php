@@ -25,20 +25,30 @@ class LoginController extends Controller
         $token = GenerateToken::generateToken();
 
         try {
-            $user = DB::table('users')
-                ->where('mobile', $request->mobile)
-                ->first();
+
+            $user = User::where('mobile', $request->mobile)->first();
+            $user->token = $token;
+            $user->save();
+
+            return redirect()->route('verified.mobile.form');
 
         } catch (\Exception $ex) {
+
             return view('errors_custom.login_error');
         }
 
-        return null;
+
 
     }
 
     public function logOut(Request $request)
     {
+        $auth_user = Auth::user();
+
+        $auth_user->token = null;
+        $auth_user->token_verified_at = null;
+        $auth_user->save();
+
         Auth::logout();
         $request->session()->invalidate();
         return redirect('/');
