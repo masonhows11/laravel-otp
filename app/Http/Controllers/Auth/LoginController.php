@@ -26,17 +26,25 @@ class LoginController extends Controller
 
         try {
 
-            $user = User::where('mobile', $request->mobile)->first();
-            $user->token = $token;
-            $user->save();
+            $user = User::where('mobile', $request->mobile)->exists();
+            if ($user) {
 
-            return redirect()->route('verified.mobile.form');
+                $user->token = $token;
+                $user->save();
+                return redirect()->route('verified.mobile.form');
+
+            } else {
+
+                User::create([
+                   'mobile'
+                ]);
+            }
+
 
         } catch (\Exception $ex) {
 
             return view('errors_custom.login_error');
         }
-
 
 
     }

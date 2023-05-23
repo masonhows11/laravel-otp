@@ -25,7 +25,7 @@ class LoginUserRequest extends FormRequest
     public function rules()
     {
         return [
-            'mobile' => ['required','exists:users',new MobileValidationRule()],
+            'mobile' => ['required',new MobileValidationRule()],
             //'token' => ['required','digits:6']
         ];
     }
