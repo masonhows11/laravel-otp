@@ -22,11 +22,12 @@ class LoginController extends Controller
     public function login(LoginUserRequest $request)
     {
 
-        $token = GenerateToken::generateToken();
 
         try {
+            $token = GenerateToken::generateToken();
 
             $user = User::where('mobile', $request->mobile)->exists();
+            
             if ($user) {
 
                 $user->token = $token;
@@ -36,7 +37,7 @@ class LoginController extends Controller
             } else {
 
                 User::create([
-                   'mobile' => $request->mobile,
+                    'mobile' => $request->mobile,
                     'token' => $token,
                 ]);
 

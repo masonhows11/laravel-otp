@@ -43,7 +43,7 @@
                             <input class="form-check-input" type="checkbox" name="remember"> منو فراموش نکن !
                         </label>
                     </div>
-                    
+
                     <button type="submit" class="btn btn-success  btn-register rounded-3">ورود</button>
 
                     <a href="{{ route('login.form') }}" class="btn btn-light">ارسال مجدد کد فعال سازی</a>
