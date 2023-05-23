@@ -47,6 +47,7 @@ class LoginController extends Controller
 
         $auth_user->token = null;
         $auth_user->token_verified_at = null;
+        $auth_user->remember_token = null;
         $auth_user->save();
 
         Auth::logout();
