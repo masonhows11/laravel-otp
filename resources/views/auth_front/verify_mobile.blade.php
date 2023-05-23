@@ -31,7 +31,7 @@
                     <div class="mb-3 mt-3">
                         <label for="token" class="form-label">کد فعال سازی</label>
                         <input type="text" class="@error('token') is_invalid @enderror form-control"
-                               id="token"
+                               id="token" dir="ltr"
                                name="token" value="{{ old('token') }}">
                     </div>
                     @error('token')
@@ -40,6 +40,8 @@
 
 
                     <button type="submit" class="btn btn-success  btn-register rounded-3">تایید کد</button>
+
+                    <a href="{{ route('login.form') }}" class="btn btn-light">ارسال مجدد کد فعال سازی</a>
                 </form>
             </div>
 
