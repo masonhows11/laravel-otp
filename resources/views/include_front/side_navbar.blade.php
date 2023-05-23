@@ -7,7 +7,7 @@
         </li>
         @if(\Illuminate\Support\Facades\Auth::check())
             <li class="nav-item">
-                <a href="{{ route('dashboard') }}" class="nav-link">پروفایل</a>
+                <a href="#" class="nav-link">پروفایل</a>
             </li>
             <li class="nav-item">
                 <a href="{{ route('logout') }}" class="nav-link">خروج</a>

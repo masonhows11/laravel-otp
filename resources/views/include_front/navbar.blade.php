@@ -11,10 +11,10 @@
             @if(Auth::check())
                 <li class="nav-item dropdown">
                     <a href="#" class="nav-link" role="button" data-bs-toggle="dropdown" aria-expanded="false">
-                        <img src="{{ asset('assets/images/users/icons8-user-32.png') }}" alt="user icon">
+                        <img src="{{ asset('images/users/icons8-user-32.png') }}" alt="user icon">
                     </a>
                     <ul class="dropdown-menu w3-flat-clouds">
-                        <li><a class="dropdown-item" href="{{ route('dashboard') }}">{{ \Illuminate\Support\Facades\Auth::user()->name }}</a></li>
+                        <li><a class="dropdown-item" href="#">{{ \Illuminate\Support\Facades\Auth::user()->name }}</a></li>
                         <li><hr class="dropdown-divider"></li>
                         <li><a class="dropdown-item" href="#">حساب کاربری</a></li>
                         <li><hr class="dropdown-divider"></li>

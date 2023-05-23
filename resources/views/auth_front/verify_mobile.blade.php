@@ -17,8 +17,6 @@
                 <form action="{{ route('verified.mobile') }}" method="post">
                     @csrf
 
-
-
                     <div class="mb-3 mt-3">
                         <label for="mobile" class="form-label">موبایل</label>
                         <input type="text" class="@error('mobile') is_invalid @enderror form-control"
@@ -34,7 +32,7 @@
                         <label for="token" class="form-label">کد فعال سازی</label>
                         <input type="text" class="@error('token') is_invalid @enderror form-control"
                                id="token"
-                               name="token" value="{{ old('email') }}">
+                               name="token" value="{{ old('token') }}">
                     </div>
                     @error('token')
                     <div class="alert alert-danger">{{ $message }}</div>

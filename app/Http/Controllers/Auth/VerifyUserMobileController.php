@@ -6,7 +6,6 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\VerifiedUserRequest;
 use App\Models\User;
 use App\Services\CheckExpireToken;
-use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 
 class VerifyUserMobileController extends Controller
@@ -25,9 +24,9 @@ class VerifyUserMobileController extends Controller
         $expire = CheckExpireToken::checkExpireToken($request->token, $request->mobile);
 
         if ($expire == false) {
-            return redirect()
-                ->route('verified.mobile.form')
-                ->with(['error' => 'کد فعالسازی معتبر نمی باشد.']);
+            session()->flash('error','کد فعالسازی معتبر نمی باشد.');
+            return redirect()->route('verified.mobile.form');
+
         }
         if ($user = User::where(['mobile' => $request->mobile, 'token' => $request->token])->first()) {
             Auth::login($user, $remember = true);

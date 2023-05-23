@@ -34,8 +34,6 @@ Route::get('/verified-mobile-form',[VerifyUserMobileController::class,'verifiedM
 Route::post('/verified-mobile',[VerifyUserMobileController::class,'verifiedMobile'])->name('verified.mobile');
 
 
-
-
 Route::middleware(['auth'])->group(function () {
     Route::get('/logout', [LoginController::class, 'logout'])->name('logout');
 });
