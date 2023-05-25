@@ -26,7 +26,7 @@ class RegisterController extends Controller
                 'token' => $code
             ]);
 
-            $token = $request->user()->createToken($request->token_name)->plainTextToken;
+            $token = $user->createToken('new_user')->plainTextToken;
 
             $response = [
                 'user' => $user->name,
@@ -36,7 +36,7 @@ class RegisterController extends Controller
 
             return response()->json(['response'=>$response,'status'=>200],200);
         } catch (\Exception $ex) {
-            return response()->json(['response'=>'error during register','status'=>500],200);
+            return response()->json(['response'=>$ex->getMessage(),'status'=>500],200);
         }
 
     }
