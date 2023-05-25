@@ -25,37 +25,52 @@ class LoginController extends Controller
 
             if ($user) {
 
-                $token = GenerateToken::generateToken();
+                $code = GenerateToken::generateToken();
 
-                $user->token = $token;
+                $user->token = $code;
                 $user->save();
-                return redirect()->route('verified.mobile.form');
+
+
+                $token = $user->createToken('new_user')->plainTextToken;
+                $response = [
+                    'user' => $user->name,
+                    'verifiedCode' => $code,
+                    'token' => $token,
+                ];
+                return response()->json(['response'=>$response,'status'=>200],200);
 
             } else {
 
                 // new token
-                $token = GenerateToken::generateToken();
-
+                $code = GenerateToken::generateToken();
                 // new user
                 $user = User::create([
                     'mobile' => $request->mobile,
-                    'token' => $token,
+                    'token' => $code,
                 ]);
-
                 // user role
                 $role = Role::create(['name' => 'user']);
-
                 // assign role to new user
                 $user->assignRole($role);
 
-                return redirect()->route('verified.mobile.form');
+
+
+                $token = $user->createToken('new_user')->plainTextToken;
+
+                $response = [
+                    'user' => $user->name,
+                    'verifiedCode' => $code,
+                    'token' => $token,
+                ];
+
+                return response()->json(['response'=>$response,'status'=>200],200);
 
             }
 
 
         } catch (\Exception $ex) {
 
-            return view('errors_custom.login_error');
+            return response()->json(['response'=>$ex->getMessage(),'status'=>500],200);
         }
 
 

@@ -30,7 +30,6 @@ class RegisterController extends Controller
 
             $response = [
                 'user' => $user->name,
-                'verifiedCode' => $code,
                 'token' => $token,
             ];
 
