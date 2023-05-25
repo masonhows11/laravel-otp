@@ -19,7 +19,7 @@ class CheckExpireToken
             $user = User::where('mobile',$mobile)
                 ->where('token',$token)
                 ->first();
-            $expired = Carbon::parse($user->updated_at)->addMinutes(1)->isPast();
+            $expired = Carbon::parse($user->updated_at)->addMinutes(30)->isPast();
             if($expired){
                 return false;
             }
