@@ -13,7 +13,7 @@ class VerifyUserMobileController extends Controller
     //
 
 
-    public function verifiedMobile(VerifiedUserRequest $request)
+    public function verifyMobile(VerifiedUserRequest $request)
     {
         $expire = CheckExpireToken::checkExpireToken($request->token, $request->mobile);
 

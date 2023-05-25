@@ -16,16 +16,27 @@ class RegisterController extends Controller
     public function register(RegisterUserRequest $request)
     {
         try {
-            $token = GenerateToken::generateToken();
-            User::create([
+
+            $code = GenerateToken::generateToken();
+
+            $user = User::create([
                 'name' => $request->name,
                 'mobile' => $request->mobile,
                 'email' => $request->email,
-                'token' => $token
+                'token' => $code
             ]);
-            return redirect()->route('verified.mobile.form');
+
+            $token = $request->user()->createToken($request->token_name)->plainTextToken;
+
+            $response = [
+                'user' => $user->name,
+                'verifiedCode' => $code,
+                'token' => $token,
+            ];
+
+            return response()->json(['response'=>$response,'status'=>200],200);
         } catch (\Exception $ex) {
-            return view('errors_custom.register_error');
+            return response()->json(['response'=>'error during register','status'=>500],200);
         }
 
     }

@@ -18,9 +18,11 @@ use App\Http\Controllers\Api\Auth\VerifyUserMobileController;
 */
 
 
-Route::group(['prefix'=>'api'],function (){
+Route::group(['prefix'=>'v1'],function (){
 
-    Route::post('/user/create');
+    Route::post('/user/create',[RegisterController::class,'register']);
+    Route::post('/user/login',[LoginController::class,'login']);
+    Route::post('/user/verified-mobile',[VerifyUserMobileController::class,'verifyMobile']);
 
 });
 
