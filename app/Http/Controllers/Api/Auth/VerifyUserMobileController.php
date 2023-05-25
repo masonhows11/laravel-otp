@@ -26,6 +26,10 @@ class VerifyUserMobileController extends Controller
             // get token from request
             $token = $request->bearerToken();
 
+            // get last token row from token table
+            $token = PersonalAccessToken::findToken($token);
+
+
             $response = [
                 'user' => $user->name,
                 'mobile' => $user->mobile,
