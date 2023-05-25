@@ -28,8 +28,6 @@ class LoginController extends Controller
                 $code = GenerateToken::generateToken();
                 $user->token = $code;
                 $user->save();
-
-
                 $token = $user->createToken('new_user')->plainTextToken;
                 $response = [
                     'user' => $user->name,
@@ -42,19 +40,12 @@ class LoginController extends Controller
             // if user not exists
             } else {
 
-                // new token
                 $code = GenerateToken::generateToken();
-                // new user
                 $user = User::create([
                     'mobile' => $request->mobile,
                     'token' => $code,
                 ]);
-
-
-                // assign user role to new user
                 $user->assignRole('user');
-
-
                 $token = $user->createToken('new_user')->plainTextToken;
                 $response = [
                     'user' => $user->name,

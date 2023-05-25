@@ -18,18 +18,17 @@ class VerifyUserMobileController extends Controller
         $expire = CheckExpireToken::checkExpireToken($request->token, $request->mobile);
 
         if ($expire == false) {
-            session()->flash('error', 'کد فعالسازی معتبر نمی باشد.');
-            return redirect()->route('verified.mobile.form');
-
+            return response()->json(['response' => 'کد فعال سازی معتبر نمی باشد', 'status' => 200], 200);
         }
         if ($user = User::where(['mobile' => $request->mobile, 'token' => $request->token])->first()) {
 
-            if ($request->filled('remember')) {
-                Auth::login($user, $remember = true);
-                return redirect()->route('home');
-            }
-            Auth::login($user);
-            return redirect()->route('home');
+            //            if ($request->filled('remember')) {
+            //                Auth::login($user, $remember = true);
+            //                return redirect()->route('home');
+            //            }
+            //            Auth::login($user);
+            //            return redirect()->route('home');
+
 
         }
 
