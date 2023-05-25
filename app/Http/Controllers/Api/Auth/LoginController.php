@@ -15,7 +15,6 @@ class LoginController extends Controller
     //
 
 
-
     public function login(LoginUserRequest $request)
     {
         try {
@@ -23,6 +22,7 @@ class LoginController extends Controller
 
             $user = User::where('mobile', $request->mobile)->first();
 
+            // if user exists
             if ($user) {
 
                 $code = GenerateToken::generateToken();
@@ -37,8 +37,9 @@ class LoginController extends Controller
                     'verifiedCode' => $code,
                     'token' => $token,
                 ];
-                return response()->json(['response'=>$response,'status'=>200],200);
+                return response()->json(['response' => $response, 'status' => 200], 200);
 
+            // if user not exists
             } else {
 
                 // new token
@@ -54,7 +55,6 @@ class LoginController extends Controller
                 $user->assignRole($role);
 
 
-
                 $token = $user->createToken('new_user')->plainTextToken;
 
                 $response = [
@@ -63,14 +63,14 @@ class LoginController extends Controller
                     'token' => $token,
                 ];
 
-                return response()->json(['response'=>$response,'status'=>200],200);
+                return response()->json(['response' => $response, 'status' => 200], 200);
 
             }
 
 
         } catch (\Exception $ex) {
 
-            return response()->json(['response'=>$ex->getMessage(),'status'=>500],200);
+            return response()->json(['response' => $ex->getMessage(), 'status' => 500], 200);
         }
 
 
