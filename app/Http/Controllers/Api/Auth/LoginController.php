@@ -26,7 +26,6 @@ class LoginController extends Controller
             if ($user) {
 
                 $code = GenerateToken::generateToken();
-
                 $user->token = $code;
                 $user->save();
 
@@ -34,6 +33,7 @@ class LoginController extends Controller
                 $token = $user->createToken('new_user')->plainTextToken;
                 $response = [
                     'user' => $user->name,
+                    'mobile' => $user->mobile,
                     'verifiedCode' => $code,
                     'token' => $token,
                 ];
@@ -49,27 +49,22 @@ class LoginController extends Controller
                     'mobile' => $request->mobile,
                     'token' => $code,
                 ]);
-                // user role
-                $role = Role::create(['name' => 'user']);
-                // assign role to new user
-                $user->assignRole($role);
+
+
+                // assign user role to new user
+                $user->assignRole('user');
 
 
                 $token = $user->createToken('new_user')->plainTextToken;
-
                 $response = [
                     'user' => $user->name,
+                    'mobile' => $user->mobile,
                     'verifiedCode' => $code,
                     'token' => $token,
                 ];
-
                 return response()->json(['response' => $response, 'status' => 200], 200);
-
             }
-
-
         } catch (\Exception $ex) {
-
             return response()->json(['response' => $ex->getMessage(), 'status' => 500], 200);
         }
 
