@@ -23,12 +23,16 @@ class VerifyUserMobileController extends Controller
         }
         if ($user = User::where(['mobile' => $request->mobile, 'token' => $request->token])->first()) {
 
-            // get token from request
-            $token = $request->bearerToken();
+            // get bearerToken token from request
+            // $token = $request->bearerToken();
 
             // get last token row from token table
-            $token = PersonalAccessToken::findToken($token);
+            //  $token = PersonalAccessToken::findToken($token);
 
+            // get all tokens belong to current user
+            // $token = $user->tokens;
+
+            $token = '';
 
             $response = [
                 'user' => $user->name,
@@ -39,7 +43,6 @@ class VerifyUserMobileController extends Controller
             return response()->json(['response' => $response, 'status' => 200], 200);
 
         }
-
 
 
     }
